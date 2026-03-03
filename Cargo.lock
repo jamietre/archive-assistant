@@ -119,21 +119,34 @@ name = "archive-assistant"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "bzip2 0.4.4",
- "chrono",
  "clap",
- "flate2",
  "libc",
  "lopdf",
  "processor",
  "rayon",
  "rusqlite",
+ "tempfile",
+ "tracing",
+ "tracing-subscriber",
+ "walkdir",
+ "zip",
+]
+
+[[package]]
+name = "archive-repack"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bzip2 0.4.4",
+ "chrono",
+ "clap",
+ "flate2",
+ "processor",
  "sevenz-rust2",
  "tar",
  "tempfile",
  "tracing",
  "tracing-subscriber",
- "walkdir",
  "xz2",
  "zip",
 ]
@@ -1829,20 +1842,6 @@ dependencies = [
  "zeroize",
  "zopfli",
  "zstd",
-]
-
-[[package]]
-name = "zip-rewriter"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "clap",
- "processor",
- "tempfile",
- "tracing",
- "tracing-subscriber",
- "zip",
 ]
 
 [[package]]

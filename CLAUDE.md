@@ -19,5 +19,5 @@ cargo build --workspace
 ## Workspace structure
 
 - `processor/` — shared library: config parsing, processor dispatch
-- `zip-rewriter/` — standalone ZIP member processor CLI
+- `archive-repack/` — standalone archive-to-ZIP repacker CLI
 - `archive-assistant/` — directory walker and archive converter CLI

@@ -1,7 +1,7 @@
 [workspace]
 members = [
     "processor",
-    "zip-rewriter",
+    "archive-repack",
     "archive-assistant",
 ]
 resolver = "2"

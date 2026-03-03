@@ -1,16 +1,21 @@
 [package]
-name = "zip-rewriter"
+name = "archive-repack"
 version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "zip-rewriter"
+name = "archive-repack"
 path = "src/main.rs"
 
 [dependencies]
 processor    = { path = "../processor", features = ["clap"] }
 clap         = { version = "4", features = ["derive"] }
 zip          = "2"
+tar          = "0.4"
+flate2       = "1"
+bzip2        = "0.4"
+xz2          = "0.1"
+sevenz-rust2 = "0.20"
 tempfile     = "3"
 anyhow       = "1"
 tracing      = "0.1"

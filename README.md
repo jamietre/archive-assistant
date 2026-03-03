@@ -6,16 +6,19 @@ are in a format find-anything can browse efficiently.
 
 Two tools in one workspace:
 
-- **`zip-rewriter`** — processes members of a single ZIP file through configured tools
-- **`archive-assistant`** — walks a directory tree, converts non-ZIP archives to ZIP,
-  and runs processor rules against files it encounters
+- **`archive-repack`** — reads any archive format, applies processor rules to members,
+  writes a ZIP. Standalone and useful on its own.
+- **`archive-assistant`** — walks a directory tree, decides which archives need
+  processing, calls `archive-repack`, and manages idempotency (state DB, mtime+60s).
 
 ## What it does
 
 - **OCRs image-only PDFs** — embeds a text layer so content is searchable
-- **Converts non-ZIP archives** (7z, tar, tar.gz, rar, etc.) to ZIP
+- **Converts any archive to ZIP** — 7z, tar, tar.gz, tar.bz2, tar.xz, rar → ZIP
 - **Processes files inside archives** — extracts, applies rules, repacks
-- **Idempotent** — archives carry an embedded manifest; optional SQLite state DB for top-level files
+- **Handles nested archives** — `archive-repack` shells out to itself recursively
+- **Idempotent** — ZIPs with an embedded `archive-assistant.txt` manifest are skipped;
+  optional SQLite state DB for top-level files
 
 ## Requirements
 
@@ -64,51 +67,52 @@ io = "stdin-stdout"
 For `chain`, each step's output feeds the next. For `shell`, the expression is
 passed to `sh -c` with `{input}` substituted.
 
-## `zip-rewriter`
+## `archive-repack`
 
-Process members of a single ZIP file. Rules can come from a config file, inline
-flags, or both — inline flags define a rule that is prepended to any config-file rules.
+Reads any archive, applies processor rules to members, writes a ZIP.
+Nested archives found inside are recursively repacked by shelling out to itself.
 
 ```sh
-# Using a config file
-zip-rewriter archive.zip --config zip-rewrite.toml
+# From a config file
+archive-repack input.7z --config zip-rewrite.toml
 
 # Inline rule — no config file needed
-zip-rewriter archive.zip \
+archive-repack input.7z \
   --match '*.pdf' \
   --command ocrmypdf \
   --arg '--skip-text' --arg '--quiet' --arg '{input}' --arg '{input}'
 
 # Inline shell expression
-zip-rewriter archive.zip \
+archive-repack input.tar.gz \
   --match '*.txt' \
   --shell 'cat {input} | tr a-z A-Z' \
   --io stdin-stdout
 
 # Combine: inline rule runs first, then config-file rules
-zip-rewriter archive.zip \
+archive-repack input.zip \
   --config zip-rewrite.toml \
   --match '*.png' --command convert --arg '{input}' --arg '{output}' --io file-to-file
 
+# Write manifest into output ZIP (archive-assistant always passes this)
+archive-repack input.7z --config zip-rewrite.toml --write-manifest
+
 # Dry run
-zip-rewriter --dry-run archive.zip --config zip-rewrite.toml
+archive-repack --dry-run input.7z --config zip-rewrite.toml
 
-# Reprocess even if already processed
-zip-rewriter --force archive.zip --config zip-rewrite.toml
-
-# Write result to a new file instead of in-place
-zip-rewriter archive.zip --config zip-rewrite.toml --output archive-processed.zip
+# Explicit output path
+archive-repack input.tar.gz --config zip-rewrite.toml --output /tmp/repacked.zip
 ```
 
 ### Options
 
 ```
-zip-rewriter [OPTIONS] <ZIP_FILE>
+archive-repack [OPTIONS] <INPUT>
 
 Arguments:
-  <ZIP_FILE>    ZIP file to process
+  <INPUT>    Input archive (any supported format)
 
-Config source (at least one required):
+Options:
+  --output <PATH>       Output ZIP path [default: input stem + .zip, same directory]
   --config <PATH>       Config file defining processor rules
 
 Inline rule (alternative or supplement to --config):
@@ -120,18 +124,18 @@ Inline rule (alternative or supplement to --config):
   --shell <EXPR>        Shell expression via sh -c (alternative to --command)
 
 General:
-  --output <PATH>       Write result here instead of modifying the ZIP in-place
-  --dry-run             Print what would be done without modifying the file
-  --force               Reprocess even if archive-assistant.txt manifest is present
+  --write-manifest      Embed archive-assistant.txt manifest in the output ZIP
+  --dry-run             Print what would be done without writing any output
   --verbose             Log each member being processed
 ```
 
-After processing, `archive-assistant.txt` is written into the ZIP as a manifest.
-On subsequent runs the ZIP is skipped unless `--force` is passed.
+If `ARCHIVE_REPACK_CONFIG` is set in the environment, it is used as the config
+path for recursive calls on nested archives (set automatically by `archive-assistant`).
 
 ## `archive-assistant`
 
-Walk a directory tree and preprocess everything:
+Walk a directory tree and preprocess everything. Calls `archive-repack` for
+archives; applies processor rules directly to top-level non-archive files.
 
 ```sh
 archive-assistant /path/to/documents --config zip-rewrite.toml
@@ -144,10 +148,10 @@ archive-assistant /path/to/documents --config zip-rewrite.toml \
 archive-assistant --dry-run /path/to/documents --config zip-rewrite.toml
 
 # Only convert archives, don't process top-level files
-archive-assistant --convert-only /path/to/documents --config zip-rewrite.toml
+archive-assistant --archives-only /path/to/documents --config zip-rewrite.toml
 
-# Only process top-level files, skip archive conversion
-archive-assistant --ocr-only /path/to/documents --config zip-rewrite.toml
+# Only process top-level files, skip archives
+archive-assistant --files-only /path/to/documents --config zip-rewrite.toml
 
 # Use a local temp directory (recommended when source is a network mount)
 archive-assistant /mnt/nas/documents --config zip-rewrite.toml \
@@ -163,16 +167,28 @@ Arguments:
   <PATH>    Directory to process
 
 Options:
-  --config <PATH>       Config file [default: zip-rewrite.toml]
-  --state-db <PATH>     SQLite DB for tracking processed files (recommended for large collections)
+  --config <PATH>       Config file (applied to top-level files and forwarded to archive-repack)
+  --state-db <PATH>     SQLite DB for tracking processed files
   --temp-dir <PATH>     Local temp directory [default: system temp]
   --dry-run             Print what would be done without modifying files
-  --ocr-only            Only process top-level files, skip archive conversion
-  --convert-only        Only convert archives, skip top-level file processing
-  --no-archive-files    Don't process files inside archives
+  --files-only          Only process top-level files, skip archives
+  --archives-only       Only convert archives, skip top-level file processing
+  --no-archive-files    Don't apply processor rules to files inside archives
   --jobs <N>            Parallel workers [default: CPUs / 2]
-  --verbose             Log each file being processed
+  --verbose             Log each file processed
 ```
+
+`archive-assistant` expects `archive-repack` to be in the same directory as
+itself (the case when both are installed from this workspace). Falls back to PATH.
+
+### Idempotency
+
+- **Non-ZIP archives**: always processed — their existence means they haven't
+  been through `archive-repack` yet (which would have produced a ZIP).
+- **ZIP archives**: skipped if they contain `archive-assistant.txt`. Processed otherwise.
+- **Top-level files**: skipped if `(path, mtime)` is in the state DB. PDFs are also
+  checked for an existing text layer (`pdftotext`) or ocrmypdf stamp before invoking
+  the processor.
 
 ## Running over SMB / network mounts
 
@@ -193,6 +209,6 @@ archive-assistant /mnt/nas/documents \
 cargo build --workspace --release
 ```
 
-Binaries are at `target/release/zip-rewriter` and `target/release/archive-assistant`.
+Binaries are at `target/release/archive-repack` and `target/release/archive-assistant`.
 
 See [PLAN.md](PLAN.md) for full design documentation.

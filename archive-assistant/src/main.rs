@@ -4,9 +4,8 @@ mod state;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Mutex;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::Parser;
 use rayon::prelude::*;
 use tracing::info;
@@ -14,7 +13,7 @@ use walkdir::WalkDir;
 
 use processor::{apply_rule, Config, ProcessResult};
 
-use crate::archive::{archive_kind, is_archive, process_archive, ArchiveKind};
+use crate::archive::{is_archive, is_zip, repack_output_path, zip_has_manifest};
 use crate::mtime::{bump_mtime, get_mtime};
 use crate::state::StateDb;
 
@@ -24,9 +23,10 @@ struct Args {
     /// Directory to process
     path: PathBuf,
 
-    /// Config file for processor rules
-    #[arg(long, default_value = "zip-rewrite.toml")]
-    config: PathBuf,
+    /// Config file for processor rules (passed to archive-repack for archives,
+    /// applied directly to top-level files)
+    #[arg(long)]
+    config: Option<PathBuf>,
 
     /// SQLite database for tracking processed files
     #[arg(long)]
@@ -42,13 +42,13 @@ struct Args {
 
     /// Only process top-level files, skip archive conversion
     #[arg(long)]
-    ocr_only: bool,
+    files_only: bool,
 
     /// Only convert archives, skip top-level file processing
     #[arg(long)]
-    convert_only: bool,
+    archives_only: bool,
 
-    /// Don't process files inside archives
+    /// Don't process files inside archives (pass --no-process-members to archive-repack)
     #[arg(long)]
     no_archive_files: bool,
 
@@ -72,23 +72,30 @@ fn main() -> Result<()> {
         .with_target(false)
         .init();
 
-    let config = Config::load(&args.config)
-        .with_context(|| format!("failed to load config from {:?}", args.config))?;
+    // Resolve the config path once; both top-level processing and archive-repack use it.
+    let config_path = args.config.as_deref();
+    let config = match config_path {
+        Some(p) => Config::load(p).with_context(|| format!("failed to load config {:?}", p))?,
+        None => Config::default(),
+    };
 
-    let jobs = args.jobs.unwrap_or_else(|| {
-        (num_cpus() / 2).max(1)
-    });
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(jobs)
-        .build_global()?;
+    // Find archive-repack binary — expect it next to our own binary.
+    let archive_repack = find_sibling_binary("archive-repack")?;
 
-    let state_db: Option<Mutex<StateDb>> = args
+    // Set ARCHIVE_REPACK_CONFIG so recursive calls inside archive-repack inherit the config.
+    if let Some(cfg) = config_path {
+        std::env::set_var("ARCHIVE_REPACK_CONFIG", cfg);
+    }
+
+    let jobs = args.jobs.unwrap_or_else(|| (num_cpus() / 2).max(1));
+    rayon::ThreadPoolBuilder::new().num_threads(jobs).build_global()?;
+
+    let state_db: Option<std::sync::Mutex<StateDb>> = args
         .state_db
         .as_deref()
-        .map(|p| StateDb::open(p).map(Mutex::new))
+        .map(|p| StateDb::open(p).map(std::sync::Mutex::new))
         .transpose()?;
 
-    // Collect all file paths first (walkdir is not Send).
     let paths: Vec<PathBuf> = WalkDir::new(&args.path)
         .follow_links(false)
         .into_iter()
@@ -109,96 +116,19 @@ fn main() -> Result<()> {
         }
 
         if is_archive(path) {
-            if !args.ocr_only {
-                let modified = process_archive(
-                    path,
-                    &config,
-                    !args.no_archive_files && !args.convert_only,
-                    args.dry_run,
-                )?;
-
-                if modified && !args.dry_run {
-                    // Determine the resulting path (may have changed to .zip).
-                    let result_path = if archive_kind(path) != Some(ArchiveKind::Zip) {
-                        let zip_name = path
-                            .file_stem()
-                            .unwrap_or_default()
-                            .to_string_lossy()
-                            .into_owned()
-                            + ".zip";
-                        path.with_file_name(zip_name)
-                    } else {
-                        path.clone()
-                    };
-
-                    let orig_mtime = get_mtime(path).unwrap_or(0);
-                    bump_mtime(&result_path, orig_mtime)?;
-
-                    if let Some(db) = &state_db {
-                        let new_mtime = get_mtime(&result_path)?;
-                        db.lock().unwrap().record(&result_path.to_string_lossy(), new_mtime)?;
-                    }
-                }
+            if args.files_only {
+                return Ok(());
             }
-        } else if !args.convert_only {
-            // Top-level non-archive file: apply processor rules.
-            let filename = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(&path_str);
-
-            if let Some(rule) = config.find_rule(filename) {
-                let orig_mtime = get_mtime(path)?;
-
-                // PDF-specific cheap skip checks before invoking the processor.
-                if filename.to_ascii_lowercase().ends_with(".pdf") {
-                    if pdf_has_text(path) {
-                        info!("{:?}: has text layer, skipping", path);
-                        if let Some(db) = &state_db {
-                            db.lock().unwrap().record(&path_str, orig_mtime)?;
-                        }
-                        return Ok(());
-                    }
-                    if pdf_has_ocrmypdf_stamp(path) {
-                        info!("{:?}: has ocrmypdf stamp, skipping", path);
-                        if let Some(db) = &state_db {
-                            db.lock().unwrap().record(&path_str, orig_mtime)?;
-                        }
-                        return Ok(());
-                    }
-                }
-
-                if args.dry_run {
-                    info!("{:?}: [dry-run] would apply rule '{}'", path, rule.r#match);
-                    return Ok(());
-                }
-
-                // Copy to temp, process, write back.
-                let tmp_dir = tempfile::TempDir::new()?;
-                let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-                let tmp_path = tmp_dir.path().join(format!("input.{}", ext));
-                std::fs::copy(path, &tmp_path)?;
-
-                let data = std::fs::read(&tmp_path)?;
-                match apply_rule(rule, &data, filename)? {
-                    ProcessResult::Modified(new_data) => {
-                        info!("{:?}: modified", path);
-                        std::fs::write(&tmp_path, &new_data)?;
-                        std::fs::copy(&tmp_path, path)?;
-                        bump_mtime(path, orig_mtime)?;
-                        if let Some(db) = &state_db {
-                            let new_mtime = get_mtime(path)?;
-                            db.lock().unwrap().record(&path_str, new_mtime)?;
-                        }
-                    }
-                    ProcessResult::Unchanged => {
-                        info!("{:?}: unchanged", path);
-                        if let Some(db) = &state_db {
-                            db.lock().unwrap().record(&path_str, orig_mtime)?;
-                        }
-                    }
-                }
-            }
+            process_archive(
+                path,
+                &archive_repack,
+                config_path,
+                &state_db,
+                args.dry_run,
+                args.verbose,
+            )?;
+        } else if !args.archives_only {
+            process_file(path, &config, &state_db, args.dry_run)?;
         }
 
         Ok(())
@@ -207,25 +137,164 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// Check if a PDF has any extractable text via pdftotext.
+/// Process an archive by invoking archive-repack.
+fn process_archive(
+    path: &Path,
+    archive_repack: &Path,
+    config_path: Option<&Path>,
+    state_db: &Option<std::sync::Mutex<StateDb>>,
+    dry_run: bool,
+    verbose: bool,
+) -> Result<()> {
+    // ZIP with manifest = already processed, skip.
+    if is_zip(path) && zip_has_manifest(path) {
+        info!("{:?}: already processed, skipping", path);
+        return Ok(());
+    }
+
+    let orig_mtime = get_mtime(path)?;
+
+    if dry_run {
+        info!("{:?}: [dry-run] would call archive-repack", path);
+        return Ok(());
+    }
+
+    let output_path = repack_output_path(path);
+
+    let mut cmd = Command::new(archive_repack);
+    cmd.arg(path).arg("--output").arg(&output_path).arg("--write-manifest");
+    if let Some(cfg) = config_path {
+        cmd.arg("--config").arg(cfg);
+    }
+    if verbose {
+        cmd.arg("--verbose");
+    }
+
+    info!("{:?}: calling archive-repack", path);
+    let status = cmd
+        .status()
+        .with_context(|| format!("failed to spawn archive-repack for {:?}", path))?;
+
+    if !status.success() {
+        bail!("archive-repack failed for {:?}", path);
+    }
+
+    // If format changed (non-ZIP → ZIP), delete original.
+    if output_path != path {
+        std::fs::remove_file(path)?;
+        info!("{:?}: removed original (replaced by {:?})", path, output_path);
+    }
+
+    bump_mtime(&output_path, orig_mtime)?;
+
+    if let Some(db) = state_db {
+        let new_mtime = get_mtime(&output_path)?;
+        db.lock().unwrap().record(&output_path.to_string_lossy(), new_mtime)?;
+    }
+
+    Ok(())
+}
+
+/// Apply processor rules to a top-level (non-archive) file.
+fn process_file(
+    path: &Path,
+    config: &Config,
+    state_db: &Option<std::sync::Mutex<StateDb>>,
+    dry_run: bool,
+) -> Result<()> {
+    let path_str = path.to_string_lossy();
+    let filename = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(&path_str);
+
+    let Some(rule) = config.find_rule(filename) else {
+        return Ok(());
+    };
+
+    let orig_mtime = get_mtime(path)?;
+
+    // PDF-specific cheap skip checks.
+    if filename.to_ascii_lowercase().ends_with(".pdf") {
+        if pdf_has_text(path) {
+            info!("{:?}: has text layer, skipping", path);
+            if let Some(db) = state_db {
+                db.lock().unwrap().record(&path_str, orig_mtime)?;
+            }
+            return Ok(());
+        }
+        if pdf_has_ocrmypdf_stamp(path) {
+            info!("{:?}: has ocrmypdf stamp, skipping", path);
+            if let Some(db) = state_db {
+                db.lock().unwrap().record(&path_str, orig_mtime)?;
+            }
+            return Ok(());
+        }
+    }
+
+    if dry_run {
+        info!("{:?}: [dry-run] would apply rule '{}'", path, rule.r#match);
+        return Ok(());
+    }
+
+    let tmp_dir = tempfile::TempDir::new()?;
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let tmp_path = tmp_dir.path().join(format!("input.{}", ext));
+    std::fs::copy(path, &tmp_path)?;
+
+    let data = std::fs::read(&tmp_path)?;
+    match apply_rule(rule, &data, filename)? {
+        ProcessResult::Modified(new_data) => {
+            info!("{:?}: modified", path);
+            std::fs::copy(
+                {
+                    std::fs::write(&tmp_path, &new_data)?;
+                    &tmp_path
+                },
+                path,
+            )?;
+            bump_mtime(path, orig_mtime)?;
+            if let Some(db) = state_db {
+                let new_mtime = get_mtime(path)?;
+                db.lock().unwrap().record(&path_str, new_mtime)?;
+            }
+        }
+        ProcessResult::Unchanged => {
+            info!("{:?}: unchanged", path);
+            if let Some(db) = state_db {
+                db.lock().unwrap().record(&path_str, orig_mtime)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Locate a binary that lives next to the current executable.
+fn find_sibling_binary(name: &str) -> Result<PathBuf> {
+    let exe_dir = std::env::current_exe()
+        .context("cannot determine current executable path")?;
+    let exe_dir = exe_dir.parent().context("executable has no parent directory")?;
+    let candidate = exe_dir.join(name);
+    if candidate.exists() {
+        return Ok(candidate);
+    }
+    // Fall back to PATH (useful during `cargo run`).
+    Ok(PathBuf::from(name))
+}
+
 fn pdf_has_text(path: &Path) -> bool {
-    let out = Command::new("pdftotext")
-        .arg(path)
-        .arg("-")
-        .output();
-    match out {
+    match Command::new("pdftotext").arg(path).arg("-").output() {
         Ok(o) => !o.stdout.iter().all(|b| b.is_ascii_whitespace()),
         Err(_) => false,
     }
 }
 
-/// Check XMP metadata via lopdf for ocrmypdf stamp.
 fn pdf_has_ocrmypdf_stamp(path: &Path) -> bool {
     let doc = match lopdf::Document::load(path) {
         Ok(d) => d,
         Err(_) => return false,
     };
-    // Look for "ocrmypdf" anywhere in the XMP metadata stream.
     let catalog = match doc.catalog() {
         Ok(d) => d,
         Err(_) => return false,
@@ -238,11 +307,11 @@ fn pdf_has_ocrmypdf_stamp(path: &Path) -> bool {
         lopdf::Object::Reference(r) => *r,
         _ => return false,
     };
-    let stream = match doc.get_object(metadata_id).and_then(|o| o.as_stream()) {
-        Ok(s) => s,
-        Err(_) => return false,
-    };
-    match stream.decompressed_content() {
+    match doc
+        .get_object(metadata_id)
+        .and_then(|o| o.as_stream())
+        .and_then(|s| s.decompressed_content())
+    {
         Ok(data) => data.windows(8).any(|w| w == b"ocrmypdf"),
         Err(_) => false,
     }

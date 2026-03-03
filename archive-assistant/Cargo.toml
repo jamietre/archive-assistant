@@ -12,11 +12,6 @@ processor    = { path = "../processor" }
 clap         = { version = "4", features = ["derive"] }
 walkdir      = "2"
 zip          = "2"
-tar          = "0.4"
-flate2       = "1"
-bzip2        = "0.4"
-xz2          = "0.1"
-sevenz-rust2 = "0.20"
 lopdf        = "0.34"
 rusqlite     = { version = "0.31", features = ["bundled"] }
 libc         = "0.2"
@@ -25,4 +20,3 @@ tempfile     = "3"
 rayon        = "1"
 tracing      = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-chrono       = "0.4"
