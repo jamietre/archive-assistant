@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use clap::Parser;
+use indicatif::{ProgressBar, ProgressStyle};
 use tracing::{debug, info, warn};
 use zip::write::SimpleFileOptions;
 use zip::ZipWriter;
@@ -71,9 +72,14 @@ struct Args {
     #[arg(long)]
     dry_run: bool,
 
-    /// Log each member being processed
+    /// Log each member name as it is processed
     #[arg(long)]
     verbose: bool,
+
+    /// Disable the interactive progress bar (use when output is consumed
+    /// by another tool, e.g. archive-assistant)
+    #[arg(long)]
+    no_progress: bool,
 }
 
 impl Args {
@@ -151,8 +157,9 @@ fn main() -> Result<()> {
 
     let config = args.effective_config()?;
     let output_path = args.output_path();
+    let progress = make_progress_bar(&args.input, args.no_progress);
 
-    repack(&args.input, &output_path, &config, args.write_manifest, args.dry_run)
+    repack(&args.input, &output_path, &config, args.write_manifest, args.dry_run, &progress)
 }
 
 // ── Archive detection ────────────────────────────────────────────────────────
@@ -338,11 +345,11 @@ fn repack(
     config: &Config,
     write_manifest: bool,
     dry_run: bool,
+    progress: &ProgressBar,
 ) -> Result<()> {
     info!("repacking {:?} -> {:?}", input, output);
 
     if dry_run {
-        // In dry-run mode just iterate and report; no ZipWriter needed.
         for_each_member(input, &mut |name, is_dir, _reader| {
             if is_dir {
                 return Ok(());
@@ -365,7 +372,6 @@ fn repack(
     let tmp_dir = tempfile::TempDir::new()?;
     let mut modified: Vec<String> = Vec::new();
 
-    // Open the output ZIP immediately; members are written as they are processed.
     let parent = output.parent().unwrap_or(Path::new("."));
     let tmp_zip = tempfile::NamedTempFile::new_in(parent)?;
     let mut writer = ZipWriter::new(tmp_zip.reopen()?);
@@ -381,9 +387,12 @@ fn repack(
         let filename =
             Path::new(name).file_name().and_then(|n| n.to_str()).unwrap_or(name);
 
+        progress.set_message(filename.to_owned());
+        progress.inc(1);
+        debug!("{}", name);
+
         // Nested archive: write to temp, shell out, stream result into ZIP.
         if is_archive(filename) {
-            debug!("  nested archive: {}", name);
             let nested_stem = archive_stem(filename).to_owned();
             let dir_prefix = name.strip_suffix(filename).unwrap_or("");
             let nested_zip_name = format!("{}{}.zip", dir_prefix, nested_stem);
@@ -391,7 +400,6 @@ fn repack(
             let nested_input = tmp_dir.path().join(filename);
             let nested_output = tmp_dir.path().join(format!("{}.zip", nested_stem));
 
-            // Write nested archive bytes to disk (unavoidable — subprocess needs a file).
             {
                 let mut f = std::fs::File::create(&nested_input)?;
                 io::copy(reader, &mut f)?;
@@ -406,7 +414,6 @@ fn repack(
 
             if !status.success() {
                 warn!("archive-repack failed for {}, keeping original", name);
-                // Re-read the original from disk and store it as-is.
                 let mut f = std::fs::File::open(&nested_input)?;
                 writer.start_file(name, options)?;
                 io::copy(&mut f, &mut writer)?;
@@ -415,33 +422,29 @@ fn repack(
 
             writer.start_file(&nested_zip_name, options)?;
             io::copy(&mut std::fs::File::open(&nested_output)?, &mut writer)?;
-            info!("  repacked nested: {} -> {}", name, nested_zip_name);
+            info!("repacked nested: {} -> {}", name, nested_zip_name);
             modified.push(name.to_owned());
             return Ok(());
         }
 
         // Regular member: apply processor rule or stream straight through.
         if let Some(rule) = config.find_rule(filename) {
-            info!("  processing member: {}", name);
-            // Must buffer this member to pass to the processor tool.
             let mut data = Vec::new();
             reader.read_to_end(&mut data)?;
 
             match apply_rule(rule, &data, filename)? {
                 ProcessResult::Modified(new_data) => {
-                    info!("  modified: {}", name);
+                    info!("modified: {}", name);
                     modified.push(name.to_owned());
                     writer.start_file(name, options)?;
                     writer.write_all(&new_data)?;
                 }
                 ProcessResult::Unchanged => {
-                    debug!("  unchanged: {}", name);
                     writer.start_file(name, options)?;
                     writer.write_all(&data)?;
                 }
             }
         } else {
-            // No rule: copy directly from extraction reader to ZIP writer.
             writer.start_file(name, options)?;
             io::copy(reader, &mut writer)?;
         }
@@ -460,8 +463,57 @@ fn repack(
         .persist(output)
         .with_context(|| format!("failed to write {:?}", output))?;
 
+    progress.finish_with_message(format!(
+        "done ({} modified)",
+        modified.len()
+    ));
     info!("wrote {:?} ({} member(s) modified)", output, modified.len());
     Ok(())
+}
+
+// ── Progress bar ─────────────────────────────────────────────────────────────
+
+fn make_progress_bar(input: &Path, no_progress: bool) -> ProgressBar {
+    if no_progress {
+        return ProgressBar::hidden();
+    }
+
+    // For ZIP we know the total upfront; for everything else use a spinner.
+    let total = zip_member_count(input);
+
+    let pb = match total {
+        Some(n) => {
+            let pb = ProgressBar::new(n as u64);
+            pb.set_style(
+                ProgressStyle::with_template(
+                    "{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} {msg}",
+                )
+                .unwrap()
+                .progress_chars("=>-"),
+            );
+            pb
+        }
+        None => {
+            let pb = ProgressBar::new_spinner();
+            pb.set_style(
+                ProgressStyle::with_template("{spinner:.green} {pos} members {msg}")
+                    .unwrap(),
+            );
+            pb
+        }
+    };
+
+    pb.set_message("...");
+    pb
+}
+
+fn zip_member_count(path: &Path) -> Option<usize> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    if ext != "zip" {
+        return None;
+    }
+    let archive = zip::ZipArchive::new(std::fs::File::open(path).ok()?).ok()?;
+    Some(archive.len())
 }
 
 fn build_self_cmd(

@@ -166,6 +166,8 @@ fn process_archive(
     if let Some(cfg) = config_path {
         cmd.arg("--config").arg(cfg);
     }
+    // Suppress the interactive progress bar when called as a subprocess.
+    cmd.arg("--no-progress");
     if verbose {
         cmd.arg("--verbose");
     }
