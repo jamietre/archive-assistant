@@ -295,32 +295,36 @@ fn for_each_tar<R: Read>(reader: R, callback: &mut MemberFn<'_>) -> Result<()> {
 }
 
 fn for_each_rar(path: &Path, callback: &mut MemberFn<'_>) -> Result<()> {
-    // unrar can only extract to disk; iterate the temp dir one file at a time.
-    let tmp = tempfile::TempDir::new()?;
-    let status = std::process::Command::new("unrar")
-        .args(["x", "-y"])
-        .arg(path)
-        .arg(tmp.path())
-        .status()
-        .context("failed to spawn unrar (is it installed?)")?;
-    if !status.success() {
-        bail!("unrar exited with {}", status);
-    }
-    visit_dir(tmp.path(), tmp.path(), callback)
-}
+    // The unrar crate iterates members one at a time via a typestate machine.
+    // Individual member content is returned as Vec<u8> (no streaming Read
+    // handle available), but only one member is in memory at a time.
+    let archive = unrar::Archive::new(path)
+        .open_for_processing()
+        .map_err(|e| anyhow::anyhow!("failed to open RAR {:?}: {}", path, e))?;
 
-fn visit_dir(root: &Path, dir: &Path, callback: &mut MemberFn<'_>) -> Result<()> {
-    let mut entries: Vec<_> = std::fs::read_dir(dir)?.collect::<Result<_, _>>()?;
-    entries.sort_by_key(|e| e.path());
-    for entry in entries {
-        let path = entry.path();
-        let rel = path.strip_prefix(root)?.to_string_lossy().into_owned();
-        if path.is_dir() {
-            callback(&format!("{}/", rel), true, &mut io::empty())?;
-            visit_dir(root, &path, callback)?;
+    let mut cursor = archive;
+    loop {
+        let header = cursor
+            .read_header()
+            .map_err(|e| anyhow::anyhow!("RAR read error: {}", e))?;
+
+        let Some(header) = header else { break };
+
+        let entry = header.entry();
+        let name = entry.filename.to_string_lossy().into_owned();
+
+        if entry.is_directory() {
+            let (_, rest) = header
+                .read()
+                .map_err(|e| anyhow::anyhow!("RAR skip dir error: {}", e))?;
+            callback(&format!("{}/", name), true, &mut io::empty())?;
+            cursor = rest;
         } else {
-            let mut file = std::fs::File::open(&path)?;
-            callback(&rel, false, &mut file)?;
+            let (data, rest) = header
+                .read()
+                .map_err(|e| anyhow::anyhow!("RAR read member '{}': {}", name, e))?;
+            callback(&name, false, &mut data.as_slice())?;
+            cursor = rest;
         }
     }
     Ok(())

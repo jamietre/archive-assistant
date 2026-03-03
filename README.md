@@ -30,8 +30,9 @@ apt install tesseract-ocr-eng   # or other language packs as needed
 # PDF text detection
 apt install poppler-utils       # provides pdftotext
 
-# RAR extraction (optional)
-apt install unrar
+# RAR extraction is handled by the unrar Rust crate (no external binary needed),
+# which requires the unrar shared library on some systems:
+# apt install libunrar-dev   # if the build fails looking for unrar headers
 ```
 
 ## Config file
