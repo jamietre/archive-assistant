@@ -1,0 +1,7 @@
+[workspace]
+members = [
+    "processor",
+    "zip-rewriter",
+    "archive-assistant",
+]
+resolver = "2"

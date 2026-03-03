@@ -1,0 +1,14 @@
+[tools]
+rust = "latest"
+
+[tasks.build]
+run = "cargo build --workspace"
+description = "Build all workspace crates"
+
+[tasks.clippy]
+run = "cargo clippy --workspace --all-targets -- -D warnings"
+description = "Run clippy on all workspace crates"
+
+[tasks.test]
+run = "cargo test --workspace"
+description = "Run all tests"
