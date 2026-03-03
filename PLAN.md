@@ -293,7 +293,7 @@ chrono       = "0.4"
 ```
 
 External runtime dependencies:
-- `ocrmypdf` — `pip install ocrmypdf`
+- `ocrmypdf` — `pipx install ocrmypdf`
 - `pdftotext` — poppler-utils (`apt install poppler-utils`)
 - `unrar` — for RAR extraction (`apt install unrar`)
 - Tesseract language packs (`apt install tesseract-ocr-eng`)

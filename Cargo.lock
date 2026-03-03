@@ -956,6 +956,7 @@ name = "processor"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "clap",
  "glob",
  "serde",
  "tempfile",

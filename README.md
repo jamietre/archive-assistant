@@ -20,8 +20,8 @@ Two tools in one workspace:
 ## Requirements
 
 ```sh
-# OCR support
-pip install ocrmypdf
+# OCR support (pipx manages the venv automatically)
+pipx install ocrmypdf
 apt install tesseract-ocr-eng   # or other language packs as needed
 
 # PDF text detection
@@ -66,19 +66,64 @@ passed to `sh -c` with `{input}` substituted.
 
 ## `zip-rewriter`
 
-Process members of a single ZIP file:
+Process members of a single ZIP file. Rules can come from a config file, inline
+flags, or both — inline flags define a rule that is prepended to any config-file rules.
 
 ```sh
+# Using a config file
 zip-rewriter archive.zip --config zip-rewrite.toml
 
+# Inline rule — no config file needed
+zip-rewriter archive.zip \
+  --match '*.pdf' \
+  --command ocrmypdf \
+  --arg '--skip-text' --arg '--quiet' --arg '{input}' --arg '{input}'
+
+# Inline shell expression
+zip-rewriter archive.zip \
+  --match '*.txt' \
+  --shell 'cat {input} | tr a-z A-Z' \
+  --io stdin-stdout
+
+# Combine: inline rule runs first, then config-file rules
+zip-rewriter archive.zip \
+  --config zip-rewrite.toml \
+  --match '*.png' --command convert --arg '{input}' --arg '{output}' --io file-to-file
+
 # Dry run
-zip-rewriter --dry-run archive.zip
+zip-rewriter --dry-run archive.zip --config zip-rewrite.toml
 
 # Reprocess even if already processed
-zip-rewriter --force archive.zip
+zip-rewriter --force archive.zip --config zip-rewrite.toml
 
-# Write result to a new file
-zip-rewriter archive.zip --output archive-processed.zip
+# Write result to a new file instead of in-place
+zip-rewriter archive.zip --config zip-rewrite.toml --output archive-processed.zip
+```
+
+### Options
+
+```
+zip-rewriter [OPTIONS] <ZIP_FILE>
+
+Arguments:
+  <ZIP_FILE>    ZIP file to process
+
+Config source (at least one required):
+  --config <PATH>       Config file defining processor rules
+
+Inline rule (alternative or supplement to --config):
+  --match <GLOB>        Filename pattern [default: * when --command/--shell given]
+  --command <CMD>       Command to run on matching members
+  --arg <ARG>           Argument for the command (repeatable); use {input}, {output}
+  --io <MODE>           I/O mode: in-place, file-to-file, file-to-stdout, stdin-stdout
+                        [default: in-place]
+  --shell <EXPR>        Shell expression via sh -c (alternative to --command)
+
+General:
+  --output <PATH>       Write result here instead of modifying the ZIP in-place
+  --dry-run             Print what would be done without modifying the file
+  --force               Reprocess even if archive-assistant.txt manifest is present
+  --verbose             Log each member being processed
 ```
 
 After processing, `archive-assistant.txt` is written into the ZIP as a manifest.

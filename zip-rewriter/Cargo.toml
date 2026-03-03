@@ -8,7 +8,7 @@ name = "zip-rewriter"
 path = "src/main.rs"
 
 [dependencies]
-processor    = { path = "../processor" }
+processor    = { path = "../processor", features = ["clap"] }
 clap         = { version = "4", features = ["derive"] }
 zip          = "2"
 tempfile     = "3"

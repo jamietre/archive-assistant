@@ -41,6 +41,8 @@ pub struct ChainStep {
 
 /// How a processor step receives input and delivers output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
+#[cfg_attr(feature = "clap", clap(rename_all = "kebab-case"))]
 #[serde(rename_all = "kebab-case")]
 pub enum IoMode {
     /// Tool modifies the file at `{input}` in place (`{input}` == `{output}`).

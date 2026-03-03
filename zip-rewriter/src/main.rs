@@ -1,28 +1,63 @@
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use clap::Parser;
 use tracing::info;
 use zip::write::SimpleFileOptions;
 use zip::{ZipArchive, ZipWriter};
 
-use processor::{apply_rule, Config, ProcessResult};
+use processor::{apply_rule, ChainStep, Config, IoMode, ProcessorRule, ProcessResult};
 
 const MANIFEST_NAME: &str = "archive-assistant.txt";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Parser, Debug)]
-#[command(name = "zip-rewriter", about = "Process ZIP members through configured tools")]
+#[command(
+    name = "zip-rewriter",
+    about = "Process ZIP members through configured tools",
+    long_about = "Process ZIP members through configured tools.\n\n\
+        Rules can be supplied via a config file, as inline flags, or both.\n\
+        Inline flags define a single rule that is prepended to any config-file rules.\n\n\
+        Examples:\n  \
+          zip-rewriter archive.zip --config zip-rewrite.toml\n  \
+          zip-rewriter archive.zip --match '*.pdf' --command ocrmypdf \\\n    \
+            --arg '--skip-text' --arg '--quiet' --arg '{input}' --arg '{input}'\n  \
+          zip-rewriter archive.zip --match '*.txt' --shell 'cat {input} | tr a-z A-Z' --io stdin-stdout"
+)]
 struct Args {
     /// ZIP file to process
     zip_file: PathBuf,
 
-    /// Config file
-    #[arg(long, default_value = "zip-rewrite.toml")]
-    config: PathBuf,
+    /// Config file defining processor rules
+    #[arg(long)]
+    config: Option<PathBuf>,
 
+    // ── Inline rule flags ────────────────────────────────────────────────────
+    /// Filename glob pattern the inline rule applies to [default: * (all files)]
+    #[arg(long, value_name = "GLOB")]
+    r#match: Option<String>,
+
+    /// Command to run for the inline rule
+    #[arg(long, value_name = "CMD")]
+    command: Option<String>,
+
+    /// Argument for the inline rule command (repeatable).
+    /// Use {input} and {output} as path placeholders.
+    #[arg(long = "arg", value_name = "ARG")]
+    args: Vec<String>,
+
+    /// I/O mode for the inline rule [default: in-place]
+    #[arg(long, value_name = "MODE")]
+    io: Option<IoMode>,
+
+    /// Shell expression for the inline rule (alternative to --command).
+    /// Passed to sh -c with {input} substituted.
+    #[arg(long, value_name = "EXPR", conflicts_with = "command")]
+    shell: Option<String>,
+
+    // ── General options ──────────────────────────────────────────────────────
     /// Write result to a different path instead of in-place
     #[arg(long)]
     output: Option<PathBuf>,
@@ -40,6 +75,57 @@ struct Args {
     verbose: bool,
 }
 
+impl Args {
+    /// Build the effective config: inline rule (if any) prepended to config-file rules.
+    fn effective_config(&self) -> Result<Config> {
+        // Load config file if provided.
+        let mut config = match &self.config {
+            Some(path) => Config::load(path)
+                .with_context(|| format!("failed to load config from {:?}", path))?,
+            None => Config::default(),
+        };
+
+        // Build inline rule if --command or --shell was given.
+        let has_inline = self.command.is_some() || self.shell.is_some();
+        if has_inline {
+            let pattern = self.r#match.clone().unwrap_or_else(|| "*".to_owned());
+            let io = self.io.unwrap_or(IoMode::InPlace);
+
+            let rule = if let Some(shell_expr) = &self.shell {
+                ProcessorRule {
+                    r#match: pattern,
+                    chain: vec![],
+                    shell: Some(shell_expr.clone()),
+                    io,
+                }
+            } else {
+                let command = self.command.clone().unwrap();
+                ProcessorRule {
+                    r#match: pattern,
+                    chain: vec![ChainStep {
+                        command,
+                        args: self.args.clone(),
+                        io,
+                    }],
+                    shell: None,
+                    io: IoMode::InPlace, // unused when chain is non-empty
+                }
+            };
+
+            // Prepend so the inline rule takes priority.
+            config.processor.insert(0, rule);
+        } else if self.r#match.is_some() || self.io.is_some() || !self.args.is_empty() {
+            bail!("--match, --arg, and --io require either --command or --shell");
+        }
+
+        if config.processor.is_empty() {
+            bail!("no processor rules defined — provide --config and/or --command/--shell");
+        }
+
+        Ok(config)
+    }
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
 
@@ -51,9 +137,7 @@ fn main() -> Result<()> {
         .with_target(false)
         .init();
 
-    let config = Config::load(&args.config)
-        .with_context(|| format!("failed to load config from {:?}", args.config))?;
-
+    let config = args.effective_config()?;
     let output_path = args.output.as_deref().unwrap_or(&args.zip_file);
 
     process_zip(&args.zip_file, output_path, &config, args.dry_run, args.force)?;

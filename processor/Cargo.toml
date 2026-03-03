@@ -3,6 +3,9 @@ name = "processor"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+clap = ["dep:clap"]
+
 [dependencies]
 toml         = "0.8"
 serde        = { version = "1", features = ["derive"] }
@@ -10,3 +13,4 @@ glob         = "0.3"
 anyhow       = "1"
 tempfile     = "3"
 tracing      = "0.1"
+clap         = { version = "4", features = ["derive"], optional = true }
