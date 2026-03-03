@@ -144,6 +144,16 @@ fn main() -> Result<()> {
         .with_target(false)
         .init();
 
+    // Propagate the config path to recursive calls via env var so nested
+    // archives inherit the same rules. CLI --config takes precedence over
+    // any value already in the environment (set by archive-assistant).
+    if let Some(cfg) = &args.config {
+        // Canonicalise so the path is valid regardless of where the child runs.
+        if let Ok(abs) = cfg.canonicalize() {
+            std::env::set_var("ARCHIVE_REPACK_CONFIG", abs);
+        }
+    }
+
     let config = args.effective_config()?;
     let output_path = args.output_path();
 
