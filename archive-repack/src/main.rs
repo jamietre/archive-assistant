@@ -1,4 +1,4 @@
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -121,15 +121,13 @@ impl Args {
         if let Some(p) = &self.output {
             return p.clone();
         }
-        // Strip compound extensions (.tar.gz etc) before appending .zip.
         let name = self
             .input
             .file_name()
             .unwrap_or_default()
             .to_string_lossy()
             .to_string();
-        let stem = archive_stem(&name);
-        self.input.with_file_name(format!("{}.zip", stem))
+        self.input.with_file_name(format!("{}.zip", archive_stem(&name)))
     }
 }
 
@@ -144,11 +142,8 @@ fn main() -> Result<()> {
         .with_target(false)
         .init();
 
-    // Propagate the config path to recursive calls via env var so nested
-    // archives inherit the same rules. CLI --config takes precedence over
-    // any value already in the environment (set by archive-assistant).
+    // Propagate the config path so recursive calls on nested archives inherit it.
     if let Some(cfg) = &args.config {
-        // Canonicalise so the path is valid regardless of where the child runs.
         if let Ok(abs) = cfg.canonicalize() {
             std::env::set_var("ARCHIVE_REPACK_CONFIG", abs);
         }
@@ -179,7 +174,6 @@ fn is_archive(name: &str) -> bool {
         || n.ends_with(".rar")
 }
 
-/// Strip compound extensions (.tar.gz etc) to get the stem for naming the output ZIP.
 fn archive_stem(name: &str) -> &str {
     for suffix in &[".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz"] {
         if let Some(s) = name.strip_suffix(suffix) {
@@ -192,15 +186,16 @@ fn archive_stem(name: &str) -> &str {
         .unwrap_or(name)
 }
 
-// ── Extraction ───────────────────────────────────────────────────────────────
+// ── Streaming iteration ──────────────────────────────────────────────────────
+//
+// Each `for_each_*` function calls `callback(name, is_dir, reader)` once per
+// member. The callback receives a `&mut dyn Read` for the member's content and
+// is responsible for consuming it (or not — unread bytes are discarded).
+// Only one member's data is live at a time.
 
-struct Member {
-    name: String,
-    data: Vec<u8>,
-    is_dir: bool,
-}
+type MemberFn<'a> = dyn FnMut(&str, bool, &mut dyn Read) -> Result<()> + 'a;
 
-fn extract(path: &Path) -> Result<Vec<Member>> {
+fn for_each_member(path: &Path, callback: &mut MemberFn<'_>) -> Result<()> {
     let name = path
         .file_name()
         .unwrap_or_default()
@@ -208,13 +203,13 @@ fn extract(path: &Path) -> Result<Vec<Member>> {
         .to_ascii_lowercase();
 
     if name.ends_with(".tar.gz") || name.ends_with(".tgz") {
-        return extract_tar(flate2::read::GzDecoder::new(std::fs::File::open(path)?));
+        return for_each_tar(flate2::read::GzDecoder::new(std::fs::File::open(path)?), callback);
     }
     if name.ends_with(".tar.bz2") || name.ends_with(".tbz2") {
-        return extract_tar(bzip2::read::BzDecoder::new(std::fs::File::open(path)?));
+        return for_each_tar(bzip2::read::BzDecoder::new(std::fs::File::open(path)?), callback);
     }
     if name.ends_with(".tar.xz") || name.ends_with(".txz") {
-        return extract_tar(xz2::read::XzDecoder::new(std::fs::File::open(path)?));
+        return for_each_tar(xz2::read::XzDecoder::new(std::fs::File::open(path)?), callback);
     }
 
     match path
@@ -223,91 +218,84 @@ fn extract(path: &Path) -> Result<Vec<Member>> {
         .map(|e| e.to_ascii_lowercase())
         .as_deref()
     {
-        Some("zip") => extract_zip(path),
-        Some("7z") => extract_7z(path),
-        Some("tar") => extract_tar(std::fs::File::open(path)?),
+        Some("zip") => for_each_zip(path, callback),
+        Some("7z") => for_each_7z(path, callback),
+        Some("tar") => for_each_tar(std::fs::File::open(path)?, callback),
         Some("gz") => {
             let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
-            let mut data = Vec::new();
-            flate2::read::GzDecoder::new(std::fs::File::open(path)?).read_to_end(&mut data)?;
-            Ok(vec![Member { name: stem.to_owned(), data, is_dir: false }])
+            let mut dec = flate2::read::GzDecoder::new(std::fs::File::open(path)?);
+            callback(stem, false, &mut dec)
         }
         Some("bz2") => {
             let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
-            let mut data = Vec::new();
-            bzip2::read::BzDecoder::new(std::fs::File::open(path)?).read_to_end(&mut data)?;
-            Ok(vec![Member { name: stem.to_owned(), data, is_dir: false }])
+            let mut dec = bzip2::read::BzDecoder::new(std::fs::File::open(path)?);
+            callback(stem, false, &mut dec)
         }
         Some("xz") => {
             let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
-            let mut data = Vec::new();
-            xz2::read::XzDecoder::new(std::fs::File::open(path)?).read_to_end(&mut data)?;
-            Ok(vec![Member { name: stem.to_owned(), data, is_dir: false }])
+            let mut dec = xz2::read::XzDecoder::new(std::fs::File::open(path)?);
+            callback(stem, false, &mut dec)
         }
-        Some("rar") => extract_rar(path),
+        Some("rar") => for_each_rar(path, callback),
         _ => bail!("unsupported archive format: {:?}", path),
     }
 }
 
-fn extract_zip(path: &Path) -> Result<Vec<Member>> {
+fn for_each_zip(path: &Path, callback: &mut MemberFn<'_>) -> Result<()> {
     use zip::ZipArchive;
     let mut archive = ZipArchive::new(std::fs::File::open(path)?)?;
-    let mut members = Vec::new();
-    for i in 0..archive.len() {
-        let mut entry = archive.by_index(i)?;
-        let name = entry.name().to_owned();
-        if entry.is_dir() {
-            members.push(Member { name, data: Vec::new(), is_dir: true });
-        } else {
-            let mut data = Vec::new();
-            entry.read_to_end(&mut data)?;
-            members.push(Member { name, data, is_dir: false });
-        }
+    // Collect names first to avoid borrow-checker issues with by_index inside loop.
+    let names: Vec<String> = (0..archive.len())
+        .map(|i| archive.by_index(i).map(|e| e.name().to_owned()))
+        .collect::<Result<_, _>>()?;
+    for name in names {
+        let mut entry = archive.by_name(&name)?;
+        let is_dir = entry.is_dir();
+        callback(&name, is_dir, &mut entry)?;
     }
-    Ok(members)
+    Ok(())
 }
 
-fn extract_7z(path: &Path) -> Result<Vec<Member>> {
-    let mut members = Vec::new();
+fn for_each_7z(path: &Path, callback: &mut MemberFn<'_>) -> Result<()> {
+    // The sevenz callback uses its own error type, so we stash any callback
+    // error in an Option and re-raise it after iteration completes.
+    let mut saved_error: Option<anyhow::Error> = None;
+
     sevenz_rust2::decompress_file_with_extract_fn(
         path,
         Path::new("/dev/null"),
         |entry, reader, _| {
-            if entry.is_directory() {
-                members.push(Member {
-                    name: entry.name().to_owned(),
-                    data: Vec::new(),
-                    is_dir: true,
-                });
-                return Ok(true);
+            if saved_error.is_some() {
+                return Ok(false);
             }
-            let mut data = Vec::new();
-            reader.read_to_end(&mut data)?;
-            members.push(Member { name: entry.name().to_owned(), data, is_dir: false });
+            if let Err(e) = callback(entry.name(), entry.is_directory(), reader) {
+                saved_error = Some(e);
+                return Ok(false);
+            }
             Ok(true)
         },
-    )?;
-    Ok(members)
+    )
+    .map_err(|e| anyhow::anyhow!("7z extraction failed: {}", e))?;
+
+    if let Some(e) = saved_error {
+        return Err(e);
+    }
+    Ok(())
 }
 
-fn extract_tar<R: Read>(reader: R) -> Result<Vec<Member>> {
+fn for_each_tar<R: Read>(reader: R, callback: &mut MemberFn<'_>) -> Result<()> {
     let mut archive = tar::Archive::new(reader);
-    let mut members = Vec::new();
     for entry in archive.entries()? {
         let mut entry = entry?;
         let name = entry.path()?.to_string_lossy().into_owned();
-        if entry.header().entry_type().is_dir() {
-            members.push(Member { name, data: Vec::new(), is_dir: true });
-        } else {
-            let mut data = Vec::new();
-            entry.read_to_end(&mut data)?;
-            members.push(Member { name, data, is_dir: false });
-        }
+        let is_dir = entry.header().entry_type().is_dir();
+        callback(&name, is_dir, &mut entry)?;
     }
-    Ok(members)
+    Ok(())
 }
 
-fn extract_rar(path: &Path) -> Result<Vec<Member>> {
+fn for_each_rar(path: &Path, callback: &mut MemberFn<'_>) -> Result<()> {
+    // unrar can only extract to disk; iterate the temp dir one file at a time.
     let tmp = tempfile::TempDir::new()?;
     let status = std::process::Command::new("unrar")
         .args(["x", "-y"])
@@ -318,24 +306,24 @@ fn extract_rar(path: &Path) -> Result<Vec<Member>> {
     if !status.success() {
         bail!("unrar exited with {}", status);
     }
-    collect_dir(tmp.path(), tmp.path())
+    visit_dir(tmp.path(), tmp.path(), callback)
 }
 
-fn collect_dir(root: &Path, dir: &Path) -> Result<Vec<Member>> {
+fn visit_dir(root: &Path, dir: &Path, callback: &mut MemberFn<'_>) -> Result<()> {
     let mut entries: Vec<_> = std::fs::read_dir(dir)?.collect::<Result<_, _>>()?;
     entries.sort_by_key(|e| e.path());
-    let mut members = Vec::new();
     for entry in entries {
         let path = entry.path();
         let rel = path.strip_prefix(root)?.to_string_lossy().into_owned();
         if path.is_dir() {
-            members.push(Member { name: format!("{}/", rel), data: Vec::new(), is_dir: true });
-            members.extend(collect_dir(root, &path)?);
+            callback(&format!("{}/", rel), true, &mut io::empty())?;
+            visit_dir(root, &path, callback)?;
         } else {
-            members.push(Member { name: rel, data: std::fs::read(&path)?, is_dir: false });
+            let mut file = std::fs::File::open(&path)?;
+            callback(&rel, false, &mut file)?;
         }
     }
-    Ok(members)
+    Ok(())
 }
 
 // ── Core repack logic ────────────────────────────────────────────────────────
@@ -349,122 +337,121 @@ fn repack(
 ) -> Result<()> {
     info!("repacking {:?} -> {:?}", input, output);
 
-    let members =
-        extract(input).with_context(|| format!("failed to extract {:?}", input))?;
-
-    let self_exe = std::env::current_exe()?;
-    let tmp_dir = tempfile::TempDir::new()?;
-    let mut out_members: Vec<(String, Vec<u8>)> = Vec::new();
-    let mut modified: Vec<String> = Vec::new();
-
-    for member in members {
-        if member.is_dir {
-            out_members.push((member.name, Vec::new()));
-            continue;
-        }
-
-        let filename = Path::new(&member.name)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or(&member.name);
-
-        // Nested archive: shell out to self.
-        if is_archive(filename) {
-            debug!("  nested archive: {}", member.name);
-            let nested_stem = archive_stem(filename).to_owned();
-            let dir_prefix = member
-                .name
-                .strip_suffix(filename)
-                .unwrap_or("")
-                .to_owned();
-            let nested_zip_name = format!("{}{}.zip", dir_prefix, nested_stem);
-
-            if dry_run {
-                info!("  [dry-run] would repack nested archive: {}", member.name);
-                out_members.push((member.name, member.data));
-                continue;
-            }
-
-            let nested_input = tmp_dir.path().join(filename);
-            let nested_output = tmp_dir.path().join(format!("{}.zip", nested_stem));
-            std::fs::write(&nested_input, &member.data)?;
-
-            let status = build_self_cmd(&self_exe, config, &nested_input, &nested_output, write_manifest)
-                .status()
-                .with_context(|| format!("failed to spawn archive-repack for {:?}", nested_input))?;
-
-            if !status.success() {
-                warn!("archive-repack failed for nested archive {}, keeping original", member.name);
-                out_members.push((member.name, member.data));
-                continue;
-            }
-
-            let zip_data = std::fs::read(&nested_output)?;
-            info!("  repacked nested: {} -> {}", member.name, nested_zip_name);
-            modified.push(member.name.clone());
-            out_members.push((nested_zip_name, zip_data));
-            continue;
-        }
-
-        // Regular member: apply processor rule if one matches.
-        if let Some(rule) = config.find_rule(filename) {
-            info!("  processing member: {}", member.name);
-            if dry_run {
-                info!("  [dry-run] would apply rule '{}' to: {}", rule.r#match, member.name);
-                out_members.push((member.name, member.data));
-                continue;
-            }
-
-            match apply_rule(rule, &member.data, filename)? {
-                ProcessResult::Modified(new_data) => {
-                    info!("  modified: {}", member.name);
-                    modified.push(member.name.clone());
-                    out_members.push((member.name, new_data));
-                }
-                ProcessResult::Unchanged => {
-                    debug!("  unchanged: {}", member.name);
-                    out_members.push((member.name, member.data));
-                }
-            }
-        } else {
-            out_members.push((member.name, member.data));
-        }
-    }
-
     if dry_run {
-        info!(
-            "[dry-run] would write {:?} ({} member(s) would be modified)",
-            output,
-            modified.len()
-        );
+        // In dry-run mode just iterate and report; no ZipWriter needed.
+        for_each_member(input, &mut |name, is_dir, _reader| {
+            if is_dir {
+                return Ok(());
+            }
+            let filename =
+                Path::new(name).file_name().and_then(|n| n.to_str()).unwrap_or(name);
+            if is_archive(filename) {
+                info!("  [dry-run] would repack nested archive: {}", name);
+            } else if let Some(rule) = config.find_rule(filename) {
+                info!("  [dry-run] would apply rule '{}' to: {}", rule.r#match, name);
+            }
+            Ok(())
+        })
+        .with_context(|| format!("failed to read {:?}", input))?;
+        info!("[dry-run] would write {:?}", output);
         return Ok(());
     }
 
-    // Write output ZIP.
+    let self_exe = std::env::current_exe()?;
+    let tmp_dir = tempfile::TempDir::new()?;
+    let mut modified: Vec<String> = Vec::new();
+
+    // Open the output ZIP immediately; members are written as they are processed.
     let parent = output.parent().unwrap_or(Path::new("."));
     let tmp_zip = tempfile::NamedTempFile::new_in(parent)?;
-    {
-        let mut writer = ZipWriter::new(tmp_zip.reopen()?);
-        let options =
-            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    let mut writer = ZipWriter::new(tmp_zip.reopen()?);
+    let options =
+        SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
 
-        for (name, data) in &out_members {
-            if data.is_empty() && name.ends_with('/') {
-                writer.add_directory(name, options)?;
-            } else {
-                writer.start_file(name, options)?;
-                writer.write_all(data)?;
+    for_each_member(input, &mut |name, is_dir, reader| {
+        if is_dir {
+            writer.add_directory(name, options)?;
+            return Ok(());
+        }
+
+        let filename =
+            Path::new(name).file_name().and_then(|n| n.to_str()).unwrap_or(name);
+
+        // Nested archive: write to temp, shell out, stream result into ZIP.
+        if is_archive(filename) {
+            debug!("  nested archive: {}", name);
+            let nested_stem = archive_stem(filename).to_owned();
+            let dir_prefix = name.strip_suffix(filename).unwrap_or("");
+            let nested_zip_name = format!("{}{}.zip", dir_prefix, nested_stem);
+
+            let nested_input = tmp_dir.path().join(filename);
+            let nested_output = tmp_dir.path().join(format!("{}.zip", nested_stem));
+
+            // Write nested archive bytes to disk (unavoidable — subprocess needs a file).
+            {
+                let mut f = std::fs::File::create(&nested_input)?;
+                io::copy(reader, &mut f)?;
             }
+
+            let status =
+                build_self_cmd(&self_exe, &nested_input, &nested_output, write_manifest)
+                    .status()
+                    .with_context(|| {
+                        format!("failed to spawn archive-repack for {:?}", nested_input)
+                    })?;
+
+            if !status.success() {
+                warn!("archive-repack failed for {}, keeping original", name);
+                // Re-read the original from disk and store it as-is.
+                let mut f = std::fs::File::open(&nested_input)?;
+                writer.start_file(name, options)?;
+                io::copy(&mut f, &mut writer)?;
+                return Ok(());
+            }
+
+            writer.start_file(&nested_zip_name, options)?;
+            io::copy(&mut std::fs::File::open(&nested_output)?, &mut writer)?;
+            info!("  repacked nested: {} -> {}", name, nested_zip_name);
+            modified.push(name.to_owned());
+            return Ok(());
         }
 
-        if write_manifest {
-            writer.start_file(MANIFEST_NAME, options)?;
-            writer.write_all(build_manifest(&modified).as_bytes())?;
+        // Regular member: apply processor rule or stream straight through.
+        if let Some(rule) = config.find_rule(filename) {
+            info!("  processing member: {}", name);
+            // Must buffer this member to pass to the processor tool.
+            let mut data = Vec::new();
+            reader.read_to_end(&mut data)?;
+
+            match apply_rule(rule, &data, filename)? {
+                ProcessResult::Modified(new_data) => {
+                    info!("  modified: {}", name);
+                    modified.push(name.to_owned());
+                    writer.start_file(name, options)?;
+                    writer.write_all(&new_data)?;
+                }
+                ProcessResult::Unchanged => {
+                    debug!("  unchanged: {}", name);
+                    writer.start_file(name, options)?;
+                    writer.write_all(&data)?;
+                }
+            }
+        } else {
+            // No rule: copy directly from extraction reader to ZIP writer.
+            writer.start_file(name, options)?;
+            io::copy(reader, &mut writer)?;
         }
 
-        writer.finish()?;
+        Ok(())
+    })
+    .with_context(|| format!("failed to process {:?}", input))?;
+
+    if write_manifest {
+        writer.start_file(MANIFEST_NAME, options)?;
+        writer.write_all(build_manifest(&modified).as_bytes())?;
     }
 
+    writer.finish()?;
     tmp_zip
         .persist(output)
         .with_context(|| format!("failed to write {:?}", output))?;
@@ -473,28 +460,17 @@ fn repack(
     Ok(())
 }
 
-/// Build a Command that invokes archive-repack on a nested archive, forwarding
-/// the config path (if any) and relevant flags. Processor rules defined only
-/// as inline flags are not forwarded to the child — pass --config for recursive use.
 fn build_self_cmd(
     exe: &Path,
-    config: &Config,
     input: &Path,
     output: &Path,
     write_manifest: bool,
 ) -> std::process::Command {
     let mut cmd = std::process::Command::new(exe);
     cmd.arg(input).arg("--output").arg(output);
-
-    // Forward config path via the ARCHIVE_REPACK_CONFIG env var if set,
-    // so recursive calls inherit it without re-parsing the in-memory config.
     if let Ok(cfg_path) = std::env::var("ARCHIVE_REPACK_CONFIG") {
         cmd.arg("--config").arg(cfg_path);
     }
-
-    // Suppress verbose noise from child unless we're in verbose mode ourselves.
-    let _ = config; // config forwarding via env var above; unused directly here
-
     if write_manifest {
         cmd.arg("--write-manifest");
     }
