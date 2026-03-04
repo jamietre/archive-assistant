@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+# mise description="Cut a release: update versions, changelog, build, commit, tag"
+set -euo pipefail
+
+# ── Args ──────────────────────────────────────────────────────────────────────
+
+if [[ $# -lt 1 ]]; then
+    echo "Usage: mise run release -- <version>"
+    echo "  e.g. mise run release -- 0.2.0"
+    exit 1
+fi
+
+VERSION="$1"
+
+if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo "Error: version must be semver (e.g. 0.2.0), got: $VERSION"
+    exit 1
+fi
+
+ROOT="$(git rev-parse --show-toplevel)"
+cd "$ROOT"
+
+# ── Checks ────────────────────────────────────────────────────────────────────
+
+CURRENT=$(grep '^version' archive-repack/Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+TAG="v$VERSION"
+
+if git tag | grep -qx "$TAG"; then
+    echo "Error: tag $TAG already exists"
+    exit 1
+fi
+
+if [[ -n "$(git status --porcelain)" ]]; then
+    echo "Error: working tree is dirty — commit or stash changes first"
+    git status --short
+    exit 1
+fi
+
+# ── Confirmation ──────────────────────────────────────────────────────────────
+
+echo ""
+echo "  Current version : $CURRENT"
+echo "  New version     : $VERSION"
+echo "  Tag             : $TAG"
+echo ""
+echo "  Steps:"
+echo "    1. cargo clippy"
+echo "    2. cargo test"
+echo "    3. Update version in all Cargo.toml files"
+echo "    4. Update CHANGELOG.md (Unreleased → $VERSION)"
+echo "    5. cargo build --release"
+echo "    6. git commit + git tag $TAG"
+echo ""
+read -r -p "Proceed? [y/N] " yn
+case "$yn" in
+    [yY]) ;;
+    *) echo "Aborted."; exit 0 ;;
+esac
+echo ""
+
+# ── Clippy ────────────────────────────────────────────────────────────────────
+
+echo "==> clippy"
+cargo clippy --workspace --all-targets -- -D warnings
+
+# ── Tests ─────────────────────────────────────────────────────────────────────
+
+echo "==> tests"
+cargo test --workspace
+
+# ── Bump versions ─────────────────────────────────────────────────────────────
+
+echo "==> bumping versions: $CURRENT -> $VERSION"
+for toml in processor/Cargo.toml archive-repack/Cargo.toml archive-assistant/Cargo.toml; do
+    sed -i "s/^version = \"$CURRENT\"/version = \"$VERSION\"/" "$toml"
+done
+# Update the Cargo.lock
+cargo generate-lockfile 2>/dev/null || cargo build --workspace -q 2>/dev/null || true
+
+# ── Changelog ─────────────────────────────────────────────────────────────────
+
+echo "==> updating CHANGELOG.md"
+DATE=$(date -u +%Y-%m-%d)
+sed -i "s/^## Unreleased$/## $VERSION — $DATE/" CHANGELOG.md
+
+# ── Release build ─────────────────────────────────────────────────────────────
+
+echo "==> cargo build --release"
+cargo build --workspace --release
+
+# ── Commit + tag ──────────────────────────────────────────────────────────────
+
+echo "==> committing and tagging $TAG"
+git add processor/Cargo.toml archive-repack/Cargo.toml archive-assistant/Cargo.toml \
+        Cargo.lock CHANGELOG.md
+git commit -m "Release $VERSION"
+git tag -a "$TAG" -m "Release $VERSION"
+
+echo ""
+echo "Done. Push with:"
+echo "  git push && git push origin $TAG"
