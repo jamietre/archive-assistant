@@ -64,12 +64,13 @@ fn apply_shell(expr: &str, io: IoMode, input_data: &[u8], filename: &str) -> Res
                 .arg(&expanded)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
-                .stderr(Stdio::inherit())
+                .stderr(Stdio::piped())
                 .spawn()
                 .context("failed to spawn sh")?;
             child.stdin.take().unwrap().write_all(input_data)?;
             let output = child.wait_with_output()?;
-            check_status(&output.status, "sh", &expanded)?;
+            log_stderr("sh", &output.stderr);
+            check_status(&output.status, "sh", &expanded, &output.stderr)?;
             Ok(output.stdout)
         }
         IoMode::FileToStdout | IoMode::InPlace | IoMode::FileToFile => {
@@ -79,10 +80,11 @@ fn apply_shell(expr: &str, io: IoMode, input_data: &[u8], filename: &str) -> Res
                 .arg(&expanded)
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
-                .stderr(Stdio::inherit())
+                .stderr(Stdio::piped())
                 .output()
                 .context("failed to spawn sh")?;
-            check_status(&output.status, "sh", &expanded)?;
+            log_stderr("sh", &output.stderr);
+            check_status(&output.status, "sh", &expanded, &output.stderr)?;
             if output.stdout.is_empty() {
                 // Shell modified file in place; read it back.
                 let data = std::fs::read(&input_path)?;
@@ -101,14 +103,15 @@ fn run_step(command: &str, args: &[String], io: IoMode, input_data: &[u8], filen
             let tmp = write_temp(input_data, extension_from(filename))?;
             let path = tmp.path().to_owned();
             let expanded_args = expand_args(args, &path, &path);
-            let status = Command::new(command)
+            let output = Command::new(command)
                 .args(&expanded_args)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
-                .stderr(Stdio::inherit())
-                .status()
+                .stderr(Stdio::piped())
+                .output()
                 .with_context(|| format!("failed to spawn '{}'", command))?;
-            check_status(&status, command, &format!("{:?}", expanded_args))?;
+            log_stderr(command, &output.stderr);
+            check_status(&output.status, command, &format!("{:?}", expanded_args), &output.stderr)?;
             let result = std::fs::read(&path)?;
             Ok(result)
         }
@@ -118,14 +121,15 @@ fn run_step(command: &str, args: &[String], io: IoMode, input_data: &[u8], filen
             let output_tmp = NamedTempFile::new()?;
             let output_path = output_tmp.path().to_owned();
             let expanded_args = expand_args(args, &input_path, &output_path);
-            let status = Command::new(command)
+            let output = Command::new(command)
                 .args(&expanded_args)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
-                .stderr(Stdio::inherit())
-                .status()
+                .stderr(Stdio::piped())
+                .output()
                 .with_context(|| format!("failed to spawn '{}'", command))?;
-            check_status(&status, command, &format!("{:?}", expanded_args))?;
+            log_stderr(command, &output.stderr);
+            check_status(&output.status, command, &format!("{:?}", expanded_args), &output.stderr)?;
             let result = std::fs::read(&output_path)?;
             Ok(result)
         }
@@ -137,10 +141,11 @@ fn run_step(command: &str, args: &[String], io: IoMode, input_data: &[u8], filen
                 .args(&expanded_args)
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
-                .stderr(Stdio::inherit())
+                .stderr(Stdio::piped())
                 .output()
                 .with_context(|| format!("failed to spawn '{}'", command))?;
-            check_status(&output.status, command, &format!("{:?}", expanded_args))?;
+            log_stderr(command, &output.stderr);
+            check_status(&output.status, command, &format!("{:?}", expanded_args), &output.stderr)?;
             Ok(output.stdout)
         }
         IoMode::StdinStdout => {
@@ -148,12 +153,13 @@ fn run_step(command: &str, args: &[String], io: IoMode, input_data: &[u8], filen
                 .args(args)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
-                .stderr(Stdio::inherit())
+                .stderr(Stdio::piped())
                 .spawn()
                 .with_context(|| format!("failed to spawn '{}'", command))?;
             child.stdin.take().unwrap().write_all(input_data)?;
             let output = child.wait_with_output()?;
-            check_status(&output.status, command, &format!("{:?}", args))?;
+            log_stderr(command, &output.stderr);
+            check_status(&output.status, command, &format!("{:?}", args), &output.stderr)?;
             Ok(output.stdout)
         }
     }
@@ -187,9 +193,23 @@ fn extension_from(filename: &str) -> &str {
         .unwrap_or("")
 }
 
-fn check_status(status: &std::process::ExitStatus, cmd: &str, detail: &str) -> Result<()> {
+fn log_stderr(command: &str, stderr: &[u8]) {
+    if !stderr.is_empty() {
+        let text = String::from_utf8_lossy(stderr);
+        for line in text.lines() {
+            debug!("  [{}] {}", command, line);
+        }
+    }
+}
+
+fn check_status(status: &std::process::ExitStatus, cmd: &str, detail: &str, stderr: &[u8]) -> Result<()> {
     if !status.success() {
-        bail!("'{}' exited with {}: {}", cmd, status, detail);
+        let stderr_str = String::from_utf8_lossy(stderr);
+        if stderr_str.trim().is_empty() {
+            bail!("'{}' exited with {}: {}", cmd, status, detail);
+        } else {
+            bail!("'{}' exited with {}: {}\nstderr:\n{}", cmd, status, detail, stderr_str.trim_end());
+        }
     }
     Ok(())
 }

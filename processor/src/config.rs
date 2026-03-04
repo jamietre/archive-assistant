@@ -5,6 +5,12 @@ use serde::{Deserialize, Serialize};
 pub struct Config {
     #[serde(default)]
     pub processor: Vec<ProcessorRule>,
+
+    /// Glob patterns matched against each member's full path inside the archive.
+    /// Members that match any pattern are omitted from the output archive.
+    /// e.g. `["*.DS_Store", "__MACOSX/**"]`
+    #[serde(default)]
+    pub exclude: Vec<String>,
 }
 
 /// One rule: a filename pattern and what to do when it matches.
@@ -66,6 +72,12 @@ impl Config {
     /// Find the first rule whose pattern matches `filename`.
     pub fn find_rule(&self, filename: &str) -> Option<&ProcessorRule> {
         self.processor.iter().find(|rule| glob_match(&rule.r#match, filename))
+    }
+
+    /// Returns `true` if `member_path` (the full path inside the archive) matches
+    /// any pattern in `exclude`.
+    pub fn is_excluded(&self, member_path: &str) -> bool {
+        self.exclude.iter().any(|pat| glob_match(pat, member_path))
     }
 }
 

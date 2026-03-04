@@ -16,7 +16,7 @@ Two tools in one workspace:
 - **OCRs image-only PDFs** — embeds a text layer so content is searchable
 - **Converts any archive to ZIP** — 7z, tar, tar.gz, tar.bz2, tar.xz, rar → ZIP
 - **Processes files inside archives** — extracts, applies rules, repacks
-- **Handles nested archives** — `archive-repack` shells out to itself recursively
+- **Handles nested archives** — configurable via `--nested`: pass through unchanged (default), repack recursively, or flatten contents into subdirectories
 - **Idempotent** — ZIPs with an embedded `archive-assistant.txt` manifest are skipped;
   optional SQLite state DB for top-level files
 
@@ -42,6 +42,9 @@ Both tools use the same TOML config to define what happens to each file type.
 ```toml
 # zip-rewrite.toml
 
+# Exclude macOS metadata and Windows thumbnails from the output archive
+exclude = ["__MACOSX/**", "*.DS_Store", "Thumbs.db"]
+
 # OCR image-only PDFs using ocrmypdf (in-place)
 [[processor]]
 match = "*.pdf"
@@ -55,6 +58,17 @@ match = "*.txt"
 shell = "cat {input} | tr '[:lower:]' '[:upper:]'"
 io = "stdin-stdout"
 ```
+
+### `exclude`
+
+A list of glob patterns matched against each member's **full path** inside the archive.
+Members that match any pattern are omitted from the output ZIP entirely.
+
+```toml
+exclude = ["__MACOSX/**", "*.DS_Store", "Thumbs.db", "**/.gitkeep"]
+```
+
+Patterns can also be supplied per-invocation via `--exclude` on the command line (see below).
 
 ### I/O modes
 
@@ -71,7 +85,7 @@ passed to `sh -c` with `{input}` substituted.
 ## `archive-repack`
 
 Reads any archive, applies processor rules to members, writes a ZIP.
-Nested archives found inside are recursively repacked by shelling out to itself.
+How nested archives inside the input are handled is controlled by `--nested`.
 
 ```sh
 # From a config file
@@ -97,12 +111,40 @@ archive-repack input.zip \
 # Write manifest into output ZIP (archive-assistant always passes this)
 archive-repack input.7z --config zip-rewrite.toml --write-manifest
 
+# Exclude files by glob pattern (CLI flag, repeatable)
+archive-repack input.zip --exclude "*.DS_Store" --exclude "__MACOSX/**"
+
+# Repack nested archives recursively (default is passthrough)
+archive-repack input.7z --config zip-rewrite.toml --nested repack
+
+# Flatten nested archives into subdirectories
+archive-repack input.7z --config zip-rewrite.toml --nested flatten
+
 # Dry run
 archive-repack --dry-run input.7z --config zip-rewrite.toml
 
 # Explicit output path
 archive-repack input.tar.gz --config zip-rewrite.toml --output /tmp/repacked.zip
 ```
+
+### `--nested <MODE>`
+
+Controls what happens when a nested archive is found inside the input:
+
+| Mode | Behaviour |
+|------|-----------|
+| `passthrough` (default) | Copy the nested archive into the output ZIP unchanged |
+| `repack` | Shell out to `archive-repack` recursively; nested archive becomes a repacked ZIP member |
+| `flatten` | Expand contents into a subdirectory named after the archive; processor rules apply to members |
+
+Example with `--nested flatten`:
+```
+input.7z/docs/inner.zip → out.zip/docs/inner/fileA.pdf
+                           out.zip/docs/inner/fileB.txt
+```
+
+The `--nested` flag is forwarded to recursive subprocess calls so deeply nested
+archives are handled consistently.
 
 ### Options
 
@@ -125,6 +167,8 @@ Inline rule (alternative or supplement to --config):
   --shell <EXPR>        Shell expression via sh -c (alternative to --command)
 
 General:
+  --exclude <GLOB>      Omit members matching this glob from the output (repeatable)
+  --nested <MODE>       How to handle nested archives: passthrough (default), repack, flatten
   --write-manifest      Embed archive-assistant.txt manifest in the output ZIP
   --dry-run             Print what would be done without writing any output
   --verbose             Log each member being processed

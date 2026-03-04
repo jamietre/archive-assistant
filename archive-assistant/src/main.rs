@@ -2,11 +2,14 @@ mod archive;
 mod mtime;
 mod state;
 
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use tracing::info;
 use walkdir::WalkDir;
@@ -61,15 +64,57 @@ struct Args {
     verbose: bool,
 }
 
+// ── Tracing + indicatif integration ──────────────────────────────────────────
+
+struct MpWriter(Arc<MultiProgress>);
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for MpWriter {
+    type Writer = MpLine;
+    fn make_writer(&'a self) -> MpLine {
+        MpLine { mp: Arc::clone(&self.0), buf: Vec::new() }
+    }
+}
+
+struct MpLine {
+    mp: Arc<MultiProgress>,
+    buf: Vec<u8>,
+}
+
+impl Write for MpLine {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        self.buf.extend_from_slice(data);
+        Ok(data.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Drop for MpLine {
+    fn drop(&mut self) {
+        if !self.buf.is_empty() {
+            let s = String::from_utf8_lossy(&self.buf);
+            let _ = self.mp.println(s.trim_end_matches('\n'));
+        }
+    }
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
+    let mp = Arc::new(MultiProgress::new());
+
+    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+    tracing_subscriber::registry()
+        .with(
             tracing_subscriber::EnvFilter::from_default_env()
                 .add_directive(if args.verbose { "debug".parse()? } else { "info".parse()? }),
         )
-        .with_target(false)
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_target(false)
+                .with_writer(MpWriter(Arc::clone(&mp))),
+        )
         .init();
 
     // Resolve the config path once; both top-level processing and archive-repack use it.
@@ -104,6 +149,19 @@ fn main() -> Result<()> {
         .map(|e| e.into_path())
         .collect();
 
+    let progress = {
+        let pb = mp.add(ProgressBar::new(paths.len() as u64));
+        pb.set_style(
+            ProgressStyle::with_template(
+                "{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} {msg}",
+            )
+            .unwrap()
+            .progress_chars("=>-"),
+        );
+        pb.set_message("scanning...");
+        pb
+    };
+
     paths.par_iter().try_for_each(|path| -> Result<()> {
         let path_str = path.to_string_lossy();
 
@@ -111,12 +169,16 @@ fn main() -> Result<()> {
         if let Some(db) = &state_db {
             let mtime = get_mtime(path)?;
             if db.lock().unwrap().is_current(&path_str, mtime)? {
+                progress.inc(1);
                 return Ok(());
             }
         }
 
+        progress.set_message(path_str.to_string());
+
         if is_archive(path) {
             if args.files_only {
+                progress.inc(1);
                 return Ok(());
             }
             process_archive(
@@ -131,8 +193,11 @@ fn main() -> Result<()> {
             process_file(path, &config, &state_db, args.dry_run)?;
         }
 
+        progress.inc(1);
         Ok(())
     })?;
+
+    progress.finish_with_message("done");
 
     Ok(())
 }
@@ -314,7 +379,7 @@ fn pdf_has_ocrmypdf_stamp(path: &Path) -> bool {
         .and_then(|o| o.as_stream())
         .and_then(|s| s.decompressed_content())
     {
-        Ok(data) => data.windows(8).any(|w| w == b"ocrmypdf"),
+        Ok(data) => data.windows(8).any(|w| w.eq_ignore_ascii_case(b"ocrmypdf")),
         Err(_) => false,
     }
 }

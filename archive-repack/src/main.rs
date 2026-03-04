@@ -1,10 +1,11 @@
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use clap::Parser;
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use tracing::{debug, info, warn};
 use zip::write::SimpleFileOptions;
 use zip::ZipWriter;
@@ -13,6 +14,44 @@ use processor::{apply_rule, ChainStep, Config, IoMode, ProcessorRule, ProcessRes
 
 const MANIFEST_NAME: &str = "archive-assistant.txt";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+// ── Tracing + indicatif integration ──────────────────────────────────────────
+//
+// Routes tracing output through indicatif's MultiProgress so that log lines
+// are printed above the progress bar without overlapping it.
+
+struct MpWriter(Arc<MultiProgress>);
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for MpWriter {
+    type Writer = MpLine;
+    fn make_writer(&'a self) -> MpLine {
+        MpLine { mp: Arc::clone(&self.0), buf: Vec::new() }
+    }
+}
+
+struct MpLine {
+    mp: Arc<MultiProgress>,
+    buf: Vec<u8>,
+}
+
+impl Write for MpLine {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        self.buf.extend_from_slice(data);
+        Ok(data.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Drop for MpLine {
+    fn drop(&mut self) {
+        if !self.buf.is_empty() {
+            let s = String::from_utf8_lossy(&self.buf);
+            let _ = self.mp.println(s.trim_end_matches('\n'));
+        }
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -76,10 +115,34 @@ struct Args {
     #[arg(long)]
     verbose: bool,
 
+    /// Glob pattern to exclude from the output archive (repeatable).
+    /// Matched against the full member path, e.g. --exclude "*.DS_Store"
+    #[arg(long = "exclude", value_name = "GLOB")]
+    excludes: Vec<String>,
+
     /// Disable the interactive progress bar (use when output is consumed
     /// by another tool, e.g. archive-assistant)
     #[arg(long)]
     no_progress: bool,
+
+    /// How to handle nested archives found inside the input.
+    /// passthrough (default): copy the nested archive as-is without processing.
+    /// repack: shell out to archive-repack recursively, producing a nested ZIP.
+    /// flatten: expand contents into a subdirectory named after the archive.
+    #[arg(long, value_name = "MODE", default_value = "passthrough")]
+    nested: NestedMode,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[clap(rename_all = "kebab-case")]
+enum NestedMode {
+    /// Recursively repack nested archives as ZIPs
+    Repack,
+    /// Expand nested archive contents into a subdirectory
+    Flatten,
+    /// Copy nested archives into the output ZIP without processing (default)
+    #[default]
+    Passthrough,
 }
 
 impl Args {
@@ -120,6 +183,8 @@ impl Args {
             bail!("--match, --arg, and --io require either --command or --shell");
         }
 
+        config.exclude.extend(self.excludes.iter().cloned());
+
         Ok(config)
     }
 
@@ -133,19 +198,49 @@ impl Args {
             .unwrap_or_default()
             .to_string_lossy()
             .to_string();
-        self.input.with_file_name(format!("{}.zip", archive_stem(&name)))
+        let stem = archive_stem(&name);
+        let candidate = self.input.with_file_name(format!("{}.zip", stem));
+
+        // If the default output collides with the input (e.g. input is already a ZIP),
+        // find the next available versioned name: foo.2.zip, foo.3.zip, …
+        if candidate == self.input {
+            // Strip any existing version suffix (.N) so foo.2.zip → foo, not foo.2.
+            let (base, start) = match stem.rfind('.') {
+                Some(i) => match stem[i + 1..].parse::<u32>() {
+                    Ok(n) => (&stem[..i], n + 1),
+                    Err(_) => (stem, 2),
+                },
+                None => (stem, 2),
+            };
+            for n in start.. {
+                let versioned = self.input.with_file_name(format!("{}.{}.zip", base, n));
+                if !versioned.exists() {
+                    return versioned;
+                }
+            }
+            unreachable!()
+        }
+
+        candidate
     }
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
+    let mp = Arc::new(MultiProgress::new());
+
+    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+    tracing_subscriber::registry()
+        .with(
             tracing_subscriber::EnvFilter::from_default_env()
                 .add_directive(if args.verbose { "debug".parse()? } else { "info".parse()? }),
         )
-        .with_target(false)
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_target(false)
+                .with_writer(MpWriter(Arc::clone(&mp))),
+        )
         .init();
 
     // Propagate the config path so recursive calls on nested archives inherit it.
@@ -157,9 +252,17 @@ fn main() -> Result<()> {
 
     let config = args.effective_config()?;
     let output_path = args.output_path();
-    let progress = make_progress_bar(&args.input, args.no_progress);
+    let progress = make_progress_bar(&mp, &args.input, args.no_progress);
 
-    repack(&args.input, &output_path, &config, args.write_manifest, args.dry_run, &progress)
+    repack(
+        &args.input,
+        &output_path,
+        &config,
+        args.write_manifest,
+        args.dry_run,
+        args.nested,
+        &progress,
+    )
 }
 
 // ── Archive detection ────────────────────────────────────────────────────────
@@ -339,12 +442,107 @@ fn for_each_rar(path: &Path, callback: &mut MemberFn<'_>) -> Result<()> {
 
 // ── Core repack logic ────────────────────────────────────────────────────────
 
+/// Recursively flatten a nested archive into `writer` under `prefix/`.
+///
+/// Every member of `input` is written as `{prefix}{member_name}`. Nested
+/// archives found inside are flattened further into `{prefix}{stem}/`.
+/// Processor rules are applied to regular members exactly as in the main loop.
+#[allow(clippy::too_many_arguments)]
+fn flatten_into_zip<W: Write + std::io::Seek>(
+    input: &Path,
+    prefix: &str,
+    mut writer: &mut ZipWriter<W>,
+    config: &Config,
+    options: SimpleFileOptions,
+    modified: &mut Vec<String>,
+    tmp_dir: &tempfile::TempDir,
+    tmp_counter: &mut u32,
+    progress: &ProgressBar,
+) -> Result<()> {
+    for_each_member(input, &mut |name, is_dir, reader| {
+        let full_name = format!("{}{}", prefix, name);
+        let filename = Path::new(name).file_name().and_then(|n| n.to_str()).unwrap_or(name);
+
+        if is_dir {
+            writer.add_directory(&full_name, options)?;
+            return Ok(());
+        }
+
+        progress.set_message(full_name.clone());
+        progress.inc(1);
+
+        if config.is_excluded(&full_name) {
+            debug!("excluded: {}", full_name);
+            io::copy(reader, &mut io::sink())?;
+            return Ok(());
+        }
+
+        debug!("{}", full_name);
+
+        // Nested archive inside a flattened archive: flatten recursively.
+        if is_archive(filename) {
+            let nested_stem = archive_stem(filename).to_owned();
+            let dir_prefix = name.strip_suffix(filename).unwrap_or("");
+            let flat_prefix = format!("{}{}{}/", prefix, dir_prefix, nested_stem);
+
+            *tmp_counter += 1;
+            let nested_input = tmp_dir.path().join(format!("{}-{}", tmp_counter, filename));
+            {
+                let mut f = std::fs::File::create(&nested_input)?;
+                io::copy(reader, &mut f)?;
+            }
+
+            info!("flattening nested: {} -> {}", full_name, flat_prefix);
+            return flatten_into_zip(
+                &nested_input,
+                &flat_prefix,
+                writer,
+                config,
+                options,
+                modified,
+                tmp_dir,
+                tmp_counter,
+                progress,
+            );
+        }
+
+        // Regular member: apply processor rule or stream straight through.
+        if let Some(rule) = config.find_rule(filename) {
+            let mut data = Vec::new();
+            reader.read_to_end(&mut data)?;
+            match apply_rule(rule, &data, filename) {
+                Ok(ProcessResult::Modified(new_data)) => {
+                    info!("modified: {}", full_name);
+                    modified.push(full_name.clone());
+                    writer.start_file(&full_name, options)?;
+                    writer.write_all(&new_data)?;
+                }
+                Ok(ProcessResult::Unchanged) => {
+                    writer.start_file(&full_name, options)?;
+                    writer.write_all(&data)?;
+                }
+                Err(e) => {
+                    warn!("processor failed for '{}', keeping original: {:#}", full_name, e);
+                    writer.start_file(&full_name, options)?;
+                    writer.write_all(&data)?;
+                }
+            }
+        } else {
+            writer.start_file(&full_name, options)?;
+            io::copy(reader, &mut writer)?;
+        }
+
+        Ok(())
+    })
+}
+
 fn repack(
     input: &Path,
     output: &Path,
     config: &Config,
     write_manifest: bool,
     dry_run: bool,
+    nested: NestedMode,
     progress: &ProgressBar,
 ) -> Result<()> {
     info!("repacking {:?} -> {:?}", input, output);
@@ -354,10 +552,18 @@ fn repack(
             if is_dir {
                 return Ok(());
             }
+            if config.is_excluded(name) {
+                info!("  [dry-run] would exclude: {}", name);
+                return Ok(());
+            }
             let filename =
                 Path::new(name).file_name().and_then(|n| n.to_str()).unwrap_or(name);
             if is_archive(filename) {
-                info!("  [dry-run] would repack nested archive: {}", name);
+                match nested {
+                    NestedMode::Repack => info!("  [dry-run] would repack nested archive: {}", name),
+                    NestedMode::Flatten => info!("  [dry-run] would flatten nested archive: {}", name),
+                    NestedMode::Passthrough => info!("  [dry-run] would pass through nested archive: {}", name),
+                }
             } else if let Some(rule) = config.find_rule(filename) {
                 info!("  [dry-run] would apply rule '{}' to: {}", rule.r#match, name);
             }
@@ -371,6 +577,8 @@ fn repack(
     let self_exe = std::env::current_exe()?;
     let tmp_dir = tempfile::TempDir::new()?;
     let mut modified: Vec<String> = Vec::new();
+    let mut tmp_counter: u32 = 0;
+    let mut existing_manifest: Option<String> = None;
 
     let parent = output.parent().unwrap_or(Path::new("."));
     let tmp_zip = tempfile::NamedTempFile::new_in(parent)?;
@@ -384,47 +592,96 @@ fn repack(
             return Ok(());
         }
 
+        // Capture existing manifest so we can append to it; don't copy it through.
+        if name == MANIFEST_NAME {
+            let mut bytes = Vec::new();
+            reader.read_to_end(&mut bytes)?;
+            existing_manifest = Some(String::from_utf8_lossy(&bytes).into_owned());
+            return Ok(());
+        }
+
+        progress.set_message(name.to_owned());
+        progress.inc(1);
+
+        if config.is_excluded(name) {
+            debug!("excluded: {}", name);
+            io::copy(reader, &mut io::sink())?;
+            return Ok(());
+        }
+
         let filename =
             Path::new(name).file_name().and_then(|n| n.to_str()).unwrap_or(name);
 
-        progress.set_message(filename.to_owned());
-        progress.inc(1);
         debug!("{}", name);
 
-        // Nested archive: write to temp, shell out, stream result into ZIP.
+        // Nested archive: repack, flatten, or pass through depending on --nested.
         if is_archive(filename) {
             let nested_stem = archive_stem(filename).to_owned();
             let dir_prefix = name.strip_suffix(filename).unwrap_or("");
-            let nested_zip_name = format!("{}{}.zip", dir_prefix, nested_stem);
 
-            let nested_input = tmp_dir.path().join(filename);
-            let nested_output = tmp_dir.path().join(format!("{}.zip", nested_stem));
+            match nested {
+                NestedMode::Passthrough => {
+                    // Copy the nested archive into the output ZIP unchanged.
+                    writer.start_file(name, options)?;
+                    io::copy(reader, &mut writer)?;
+                    return Ok(());
+                }
+                NestedMode::Flatten => {
+                    tmp_counter += 1;
+                    let nested_input =
+                        tmp_dir.path().join(format!("{}-{}", tmp_counter, filename));
+                    {
+                        let mut f = std::fs::File::create(&nested_input)?;
+                        io::copy(reader, &mut f)?;
+                    }
+                    let flat_prefix = format!("{}{}/", dir_prefix, nested_stem);
+                    info!("flattening nested: {} -> {}", name, flat_prefix);
+                    flatten_into_zip(
+                        &nested_input,
+                        &flat_prefix,
+                        &mut writer,
+                        config,
+                        options,
+                        &mut modified,
+                        &tmp_dir,
+                        &mut tmp_counter,
+                        progress,
+                    )?;
+                    return Ok(());
+                }
+                NestedMode::Repack => {
+                    tmp_counter += 1;
+                    let nested_input =
+                        tmp_dir.path().join(format!("{}-{}", tmp_counter, filename));
+                    {
+                        let mut f = std::fs::File::create(&nested_input)?;
+                        io::copy(reader, &mut f)?;
+                    }
+                    let nested_zip_name = format!("{}{}.zip", dir_prefix, nested_stem);
+                    let nested_output =
+                        tmp_dir.path().join(format!("{}-{}.zip", tmp_counter, nested_stem));
 
-            {
-                let mut f = std::fs::File::create(&nested_input)?;
-                io::copy(reader, &mut f)?;
+                    let status =
+                        build_self_cmd(&self_exe, &nested_input, &nested_output, write_manifest, nested)
+                            .status()
+                            .with_context(|| {
+                                format!("failed to spawn archive-repack for {:?}", nested_input)
+                            })?;
+
+                    if !status.success() {
+                        warn!("archive-repack failed for {}, keeping original", name);
+                        writer.start_file(name, options)?;
+                        io::copy(&mut std::fs::File::open(&nested_input)?, &mut writer)?;
+                        return Ok(());
+                    }
+
+                    writer.start_file(&nested_zip_name, options)?;
+                    io::copy(&mut std::fs::File::open(&nested_output)?, &mut writer)?;
+                    info!("repacked nested: {} -> {}", name, nested_zip_name);
+                    modified.push(name.to_owned());
+                    return Ok(());
+                }
             }
-
-            let status =
-                build_self_cmd(&self_exe, &nested_input, &nested_output, write_manifest)
-                    .status()
-                    .with_context(|| {
-                        format!("failed to spawn archive-repack for {:?}", nested_input)
-                    })?;
-
-            if !status.success() {
-                warn!("archive-repack failed for {}, keeping original", name);
-                let mut f = std::fs::File::open(&nested_input)?;
-                writer.start_file(name, options)?;
-                io::copy(&mut f, &mut writer)?;
-                return Ok(());
-            }
-
-            writer.start_file(&nested_zip_name, options)?;
-            io::copy(&mut std::fs::File::open(&nested_output)?, &mut writer)?;
-            info!("repacked nested: {} -> {}", name, nested_zip_name);
-            modified.push(name.to_owned());
-            return Ok(());
         }
 
         // Regular member: apply processor rule or stream straight through.
@@ -432,14 +689,29 @@ fn repack(
             let mut data = Vec::new();
             reader.read_to_end(&mut data)?;
 
-            match apply_rule(rule, &data, filename)? {
-                ProcessResult::Modified(new_data) => {
+            // Skip PDFs that have already been processed by ocrmypdf: the XMP
+            // metadata stream is stored uncompressed and contains the string
+            // "ocrmypdf", so a raw byte search is sufficient.
+            if pdf_has_ocrmypdf_stamp(&data) {
+                debug!("already ocr'd, skipping: {}", name);
+                writer.start_file(name, options)?;
+                writer.write_all(&data)?;
+                return Ok(());
+            }
+
+            match apply_rule(rule, &data, filename) {
+                Ok(ProcessResult::Modified(new_data)) => {
                     info!("modified: {}", name);
                     modified.push(name.to_owned());
                     writer.start_file(name, options)?;
                     writer.write_all(&new_data)?;
                 }
-                ProcessResult::Unchanged => {
+                Ok(ProcessResult::Unchanged) => {
+                    writer.start_file(name, options)?;
+                    writer.write_all(&data)?;
+                }
+                Err(e) => {
+                    warn!("processor failed for '{}', keeping original: {:#}", name, e);
                     writer.start_file(name, options)?;
                     writer.write_all(&data)?;
                 }
@@ -453,9 +725,9 @@ fn repack(
     })
     .with_context(|| format!("failed to process {:?}", input))?;
 
-    if write_manifest {
+    if write_manifest || existing_manifest.is_some() {
         writer.start_file(MANIFEST_NAME, options)?;
-        writer.write_all(build_manifest(&modified).as_bytes())?;
+        writer.write_all(build_manifest(existing_manifest.as_deref(), &modified).as_bytes())?;
     }
 
     writer.finish()?;
@@ -473,17 +745,18 @@ fn repack(
 
 // ── Progress bar ─────────────────────────────────────────────────────────────
 
-fn make_progress_bar(input: &Path, no_progress: bool) -> ProgressBar {
+fn make_progress_bar(mp: &MultiProgress, input: &Path, no_progress: bool) -> ProgressBar {
     if no_progress {
         return ProgressBar::hidden();
     }
 
-    // For ZIP we know the total upfront; for everything else use a spinner.
-    let total = zip_member_count(input);
+    // For ZIP and 7z we can get the total cheaply by reading archive metadata.
+    // For RAR and tar we'd need a full sequential scan, so use a spinner instead.
+    let total = member_count(input);
 
     let pb = match total {
         Some(n) => {
-            let pb = ProgressBar::new(n as u64);
+            let pb = mp.add(ProgressBar::new(n as u64));
             pb.set_style(
                 ProgressStyle::with_template(
                     "{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} {msg}",
@@ -494,7 +767,7 @@ fn make_progress_bar(input: &Path, no_progress: bool) -> ProgressBar {
             pb
         }
         None => {
-            let pb = ProgressBar::new_spinner();
+            let pb = mp.add(ProgressBar::new_spinner());
             pb.set_style(
                 ProgressStyle::with_template("{spinner:.green} {pos} members {msg}")
                     .unwrap(),
@@ -507,13 +780,36 @@ fn make_progress_bar(input: &Path, no_progress: bool) -> ProgressBar {
     pb
 }
 
-fn zip_member_count(path: &Path) -> Option<usize> {
-    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
-    if ext != "zip" {
-        return None;
+/// Return the number of members in an archive if it can be determined cheaply
+/// (without scanning the whole file). Returns `None` for formats that require
+/// a sequential scan (RAR, tar) — use a spinner for those.
+fn member_count(path: &Path) -> Option<usize> {
+    let name = path.file_name()?.to_string_lossy().to_ascii_lowercase();
+
+    // ZIP: central directory at end of file — O(1) seek.
+    // Count only files; directories are added to the output but don't increment
+    // the progress counter, so including them inflates the total.
+    if name.ends_with(".zip") {
+        let mut archive = zip::ZipArchive::new(std::fs::File::open(path).ok()?).ok()?;
+        let mut count = 0usize;
+        for i in 0..archive.len() {
+            if let Ok(entry) = archive.by_index_raw(i) {
+                if !entry.is_dir() {
+                    count += 1;
+                }
+            }
+        }
+        return Some(count);
     }
-    let archive = zip::ZipArchive::new(std::fs::File::open(path).ok()?).ok()?;
-    Some(archive.len())
+
+    // 7z: header block at end of file — reads metadata only, no decompression.
+    if name.ends_with(".7z") {
+        let archive = sevenz_rust2::Archive::open(path).ok()?;
+        return Some(archive.files.iter().filter(|f| !f.is_directory()).count());
+    }
+
+    // RAR / tar: headers are sequential — counting requires a full pass.
+    None
 }
 
 fn build_self_cmd(
@@ -521,6 +817,7 @@ fn build_self_cmd(
     input: &Path,
     output: &Path,
     write_manifest: bool,
+    nested: NestedMode,
 ) -> std::process::Command {
     let mut cmd = std::process::Command::new(exe);
     cmd.arg(input).arg("--output").arg(output);
@@ -530,11 +827,27 @@ fn build_self_cmd(
     if write_manifest {
         cmd.arg("--write-manifest");
     }
+    let nested_str = match nested {
+        NestedMode::Repack => "repack",
+        NestedMode::Flatten => "flatten",
+        NestedMode::Passthrough => "passthrough",
+    };
+    cmd.arg("--nested").arg(nested_str);
     cmd
 }
 
-fn build_manifest(modified: &[String]) -> String {
-    let mut s = format!("archive-assistant v{}\n", VERSION);
+fn pdf_has_ocrmypdf_stamp(data: &[u8]) -> bool {
+    data.windows(8).any(|w| w.eq_ignore_ascii_case(b"ocrmypdf"))
+}
+
+fn build_manifest(prior: Option<&str>, modified: &[String]) -> String {
+    let mut s = String::new();
+    if let Some(prior) = prior {
+        s.push_str(prior.trim_end());
+        s.push('\n');
+        s.push_str("---\n");
+    }
+    s.push_str(&format!("archive-assistant v{}\n", VERSION));
     s.push_str(&format!("processed: {}\n", Utc::now().format("%Y-%m-%dT%H:%M:%SZ")));
     for name in modified {
         s.push_str(&format!("modified: {}\n", name));
