@@ -1,0 +1,54 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build release binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install unrar library
+        run: sudo apt-get install -y libunrar-dev
+
+      - name: Build
+        run: cargo build --workspace --release
+
+      - name: Package
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          mkdir -p dist
+          cp target/release/archive-repack    dist/archive-repack
+          cp target/release/archive-assistant dist/archive-assistant
+          tar -czf dist/archive-assistant-${VERSION}-x86_64-linux.tar.gz \
+            -C dist archive-repack archive-assistant
+
+      - name: Extract changelog entry
+        id: changelog
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          # Extract the section for this version from CHANGELOG.md
+          awk "/^## ${VERSION}/"',/^## [0-9]/{if(/^## [0-9]/ && !/^## '"${VERSION}"'/)exit; print}' \
+            CHANGELOG.md | head -n -1 > release-notes.txt
+          echo "notes<<EOF" >> "$GITHUB_OUTPUT"
+          cat release-notes.txt >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          body: ${{ steps.changelog.outputs.notes }}
+          files: dist/archive-assistant-*-x86_64-linux.tar.gz
