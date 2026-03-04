@@ -689,11 +689,19 @@ fn repack(
             let mut data = Vec::new();
             reader.read_to_end(&mut data)?;
 
-            // Skip PDFs that have already been processed by ocrmypdf: the XMP
-            // metadata stream is stored uncompressed and contains the string
-            // "ocrmypdf", so a raw byte search is sufficient.
+            // Skip PDFs that have already been processed by ocrmypdf.
             if pdf_has_ocrmypdf_stamp(&data) {
                 debug!("already ocr'd, skipping: {}", name);
+                writer.start_file(name, options)?;
+                writer.write_all(&data)?;
+                return Ok(());
+            }
+
+            // Skip encrypted PDFs — ocrmypdf cannot process them and will
+            // exit with InputFileError. The /Encrypt entry is always present
+            // in plain text in the PDF cross-reference structure.
+            if pdf_is_encrypted(&data) {
+                debug!("encrypted PDF, skipping processor: {}", name);
                 writer.start_file(name, options)?;
                 writer.write_all(&data)?;
                 return Ok(());
@@ -838,6 +846,10 @@ fn build_self_cmd(
 
 fn pdf_has_ocrmypdf_stamp(data: &[u8]) -> bool {
     data.windows(8).any(|w| w.eq_ignore_ascii_case(b"ocrmypdf"))
+}
+
+fn pdf_is_encrypted(data: &[u8]) -> bool {
+    data.windows(8).any(|w| w == b"/Encrypt")
 }
 
 fn build_manifest(prior: Option<&str>, modified: &[String]) -> String {

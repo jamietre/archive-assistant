@@ -256,4 +256,4 @@ cargo build --workspace --release
 
 Binaries are at `target/release/archive-repack` and `target/release/archive-assistant`.
 
-See [PLAN.md](PLAN.md) for full design documentation.
+See [docs/ARCH.md](docs/ARCH.md) for implementation details.

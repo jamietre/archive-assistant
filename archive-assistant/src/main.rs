@@ -283,6 +283,13 @@ fn process_file(
 
     // PDF-specific cheap skip checks.
     if filename.to_ascii_lowercase().ends_with(".pdf") {
+        if pdf_is_encrypted(path) {
+            info!("{:?}: encrypted, skipping", path);
+            if let Some(db) = state_db {
+                db.lock().unwrap().record(&path_str, orig_mtime)?;
+            }
+            return Ok(());
+        }
         if pdf_has_text(path) {
             info!("{:?}: has text layer, skipping", path);
             if let Some(db) = state_db {
@@ -348,6 +355,17 @@ fn find_sibling_binary(name: &str) -> Result<PathBuf> {
     }
     // Fall back to PATH (useful during `cargo run`).
     Ok(PathBuf::from(name))
+}
+
+fn pdf_is_encrypted(path: &Path) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut f) = std::fs::File::open(path) else { return false };
+    // /Encrypt lives in the PDF trailer at the end of the file.
+    let tail_size: u64 = 65536;
+    let _ = f.seek(SeekFrom::End(-(tail_size as i64)));
+    let mut buf = Vec::new();
+    let Ok(_) = f.read_to_end(&mut buf) else { return false };
+    buf.windows(8).any(|w| w == b"/Encrypt")
 }
 
 fn pdf_has_text(path: &Path) -> bool {
