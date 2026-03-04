@@ -20,6 +20,23 @@ Two tools in one workspace:
 - **Idempotent** — ZIPs with an embedded `archive-assistant.txt` manifest are skipped;
   optional SQLite state DB for top-level files
 
+## Install
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/jamietre/archive-assistant/master/install.sh | sh
+```
+
+Installs `archive-repack` and `archive-assistant` to `~/.local/bin`.
+Set `INSTALL_DIR=/usr/local/bin` to override the destination.
+
+### Build from source
+
+```sh
+cargo build --workspace --release
+```
+
+Binaries at `target/release/archive-repack` and `target/release/archive-assistant`.
+
 ## Requirements
 
 ```sh
@@ -247,13 +264,5 @@ archive-assistant /mnt/nas/documents \
     --temp-dir /tmp/archive-work \
     --state-db /tmp/archive-state.db
 ```
-
-## Build
-
-```sh
-cargo build --workspace --release
-```
-
-Binaries are at `target/release/archive-repack` and `target/release/archive-assistant`.
 
 See [docs/ARCH.md](docs/ARCH.md) for implementation details.

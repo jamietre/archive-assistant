@@ -21,9 +21,6 @@ jobs:
       - name: Cache
         uses: Swatinem/rust-cache@v2
 
-      - name: Install unrar library
-        run: sudo apt-get install -y libunrar-dev
-
       - name: Build
         run: cargo build --workspace --release
 
